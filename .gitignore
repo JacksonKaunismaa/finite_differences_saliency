@@ -1,0 +1,5 @@
+data/*
+*.pkl
+*.dict
+.ipynb_checkpoints
+
