@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import colorsys
 
 class ColorDatasetGenerator(Dataset):
     def __init__(self, **kwargs):
@@ -12,29 +13,57 @@ class ColorDatasetGenerator(Dataset):
         # image parameters
         self.size = 256 # shape of image
         self.channels = 1  # default is greyscale
+        self.bg_color = 0  # must have same number of channels 
 
         # target parameters
         self.color_classifier = None  # function that maps colors to classes (supports iterables)
         self.num_classes = 2  # how many possible classes there are
-        self.color_range = (50, 200)  # range of values that the color-to-be-classified can be
+        # greyscale
+        self.color_range = (50, 200)  # range of values that the greyscale color-to-be-classified can be
+        # RGB (which we generate as HSV for simplicity)
+        self.value_range = (20, 100) # range for value in HSV (subset of (0, 100))
+        self.saturation_range = (20, 100) # range for saturation in HSV (subset of (0, 100))
+        self.hue_range = (0, 360)  # range for hue in HSV (subset of (0, 360))
+    
         self.radius = (self.size//6, self.size//3)  # range of possible radii for circles
-        self.num_objects = 1 # for multiclass problems, if we want to classify multiple things
+        self.num_objects = 1 # supports ranges, if want multiclass
 
         # actual dataset
         #self.labels = {}  # {filename: label} mapping
-        self.num_images = 10   # totally arbitrary
+        self.image_indices = (0, 1_000_00)   # range of np.random.seeds for the given dataset
         self.options = []  # list of dataset options that need to be saved
         # self.save_dir = ""   # location for all images to be stored
         for k,v in kwargs.items():
             setattr(self, k, v)
             self.options.append(k)
+           
+    def iterative_color_cvt(self, conversion, iterable):
+        # iterates over first dimension
+        convert_func = getattr(colorsys, conversion)
+        return np.array(list(map(lambda x: convert_func(*x), iterable)))
 
-    def add_target(self, arr):
+    def generate_colors(self, amt):
+        if self.channels == 1: # greyscale
+            color = np.random.randint(*self.color_range, (amt))
+        else:  # rgb
+            hue = np.random.randint(*self.hue_range, (amt))/360
+            saturation = np.random.randint(*self.saturation_range, (amt))/100
+            value = np.random.randint(*self.value_range, (amt))/100
+            color = (self.iterative_color_cvt("hsv_to_rgb", zip(hue, saturation, value))*255.).round() #(np.array(list(map(lambda x: colorsys.hsv_to_rgb(*x), zip(hue, saturation, value))))*255).round()
+        return color
+
+    def add_target(self, arr, set_color):
         num_objects = self.num_objects # np.random.randint(*self.num_objects)
-        color = np.random.randint(*self.color_range, (num_objects, self.channels)) # rgb for now
+        
+        if set_color is not None:
+            color = np.array([set_color]*num_objects)
+        else:
+            color = self.generate_colors(num_objects)
 
         label = np.zeros((self.num_classes))
         label[self.color_classifier(color)] = 1  # multi-hot encoded
+        if self.num_classes == 2:
+            label = np.expand_dims(label[0], 0)
 
         # probably should make sure they dont overlap too much, but num_objects=1 for now
         #img_name = "img"
@@ -49,25 +78,25 @@ class ColorDatasetGenerator(Dataset):
                 arr[location[0]-x, y_coords] = color
             #img_name += f"-{radius}_{location[0]}_{location[1]}"
         #img_name += "".join(random.choice(string.ascii_letters) for _ in range(10)) + ".jpg"
-        return label#, img_name
+        return label, color, radii, locations  # doesnt really work if we are doing multiclass
 
     def add_noise(self, arr):
         num_noise = np.random.randint(*self.num_noise)
         sizes = np.random.randint(*self.noise_size, num_noise)
-        colors = np.random.randint(1, 255, (num_noise, self.channels))
+        colors = self.generate_colors(num_noise)
         locations = np.random.randint(self.noise_size[1], self.size-self.noise_size[1], (num_noise, 2))
         for size, color, location in zip(sizes, colors, locations):
             arr[location[0]:location[0]+size,location[1]:location[1]+size] = color
 
-    def generate_one(self, profile=False):
+    def generate_one(self, set_color=None, profile=False):
         #benchmark(profile=profile)
-        img = np.zeros((self.size, self.size, self.channels))
+        img = np.ones((self.size, self.size, self.channels)) * self.bg_color
         #benchmark("initialization", profile)
-        label = self.add_target(img)
+        label, color, size, pos = self.add_target(img, set_color)
         #benchmark("circle", profile)
         self.add_noise(img)
         #benchmark("noise", profile)
-        return img, label
+        return img, label, color, size, pos
 
     # as it turns out, generating data on the fly is faster any way :\
 #     def generate_data(self, amount):
@@ -80,17 +109,16 @@ class ColorDatasetGenerator(Dataset):
 #         self.data = list(self.labels.items())  # (img_name,label) pairs
 
     def __len__(self):
-        return self.num_images
+        return self.image_indices[1] - self.image_indices[0]
 
     def __getitem__(self, idx):
-        print(idx)
         if torch.is_tensor(idx):
             idx = idx.tolist()
         np.random.seed(idx)  # to make results repeatable
-        image, label = self.generate_one()
-        sample = {'image': image, 'label': label, "idx": idx}
+        image, label, color, _, __ = self.generate_one()
         if hasattr(self, "transform"):
-            sample = self.transform(sample)
+            image = self.transform(image)
+        sample = {'image': image, 'label': label, 'color': color}
         return sample
 
         # sorta pointless now?
