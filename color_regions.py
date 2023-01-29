@@ -125,6 +125,13 @@ class ColorDatasetGenerator(Dataset):
         sample = {'image': image, 'label': label, 'color': color}
         return sample
 
+    def implicit_normalization(self, inpt):
+        # since ColorDatasetGenerator.generate_one returns np.float32, transforms.ToTensor() will implicitly assume we are already 
+        #in [0,1] (even though we aren't), and won't do a divide by 255. Since we work in [0, 255] space for basically everything, and
+        # the ColorDatasetGenerator models take input in [0, 255] (due to ToTensor having assumed we were in [0,1]), we don't have to 
+        # do anything here, and only exists because TextureDatasetGenerator actually requires us to do something here
+        return inpt
+
         # sorta pointless now?
 #     def save_options(self, path):
 #         save_kwargs = {}
@@ -272,3 +279,12 @@ class TextureDatasetGenerator(Dataset):
             image = self.transform(image)
         sample = {'image': image, 'label': label}
         return sample
+
+    def implicit_normalization(self, inpt):
+        # since TextureDatasetGenerator.generate_one returns np.uint8 (since it copies from a loaded image), transforms.ToTensor()
+        # will implicitly do a divide by 255. Since we work in [0, 255] space for basically everything, this function is provided
+        # for convenience and should be called just before we pass any tensor into the model. The one exception to this is when
+        # you have already called utils.tensorize on the image, which replicates the behaviour of transforms.ToTensor() (but with
+        # better handling of adding dimensions/transposing) and thus will also implicitly do the divide by 255 operation (if the input
+        # type is np.uint8). In summary, always call either utils.tensorize xor this function before passing into the model.
+        return inpt/255.

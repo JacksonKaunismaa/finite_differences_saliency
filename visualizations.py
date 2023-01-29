@@ -5,96 +5,114 @@ from scipy.interpolate import RegularGridInterpolator
 import torch
 from tqdm import tqdm
 from network import correct  # for rate_distribution (reads it as a global variable)
+import utils
+from utils import *
 import matplotlib.pyplot as plt
+import warnings
 
 
 # PCA Stuff
 
 
-def find_pca_directions(dataset, sample_size, scales, strides):
+def find_pca_directions(dataset, sample_size, scales, strides, num_components=4):
 # begin by computing pca directions and d_output_d_alphas
     sample = []
     for _ in range(sample_size):
         sample.append(dataset.generate_one()[0])
-    sample = np.array(sample).squeeze()
+    sample = np.array(sample).squeeze().astype(np.float32)
     im_size = dataset.size
     
     if isinstance(strides, int):
         strides = [strides]*len(scales)
     
     pca_direction_grids = []
+    T = False
     for scale, stride in zip(scales, strides):
         windows = np.lib.stride_tricks.sliding_window_view(sample, (scale,scale), axis=(1,2))
-        strided_windows = windows[:, ::stride, ::stride, ...]
+        strided_windows = windows[:, ::stride, ::stride, :]  # [N, H, W, C]
                 
         xs = np.mgrid[scale:im_size:stride]
         num_grid = xs.shape[0]
-        pca_direction_grid = np.zeros((num_grid, num_grid, scale, scale))
+        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, dataset.channels))
         
         pca_fitter = decomposition.PCA(n_components=scale**2, copy=False)
         scale_fitter = StandardScaler()
         for i in tqdm(range(num_grid)):
             for j in range(num_grid):
                 # find pca direction for current patch
-                pca_selection = strided_windows[:, i, j, ...]
+                #if i == 0 and j == 7 and scale == 3:
+                #    T = True
+                pca_selection = strided_windows[:, i, j, :]
                 flattened = pca_selection.reshape(sample_size, -1)
                 normalized = scale_fitter.fit_transform(flattened)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")  # gives pointless zero-division warnings
                     pca_fitter.fit(normalized)
-                pca_direction = pca_fitter.components_[0].reshape(scale,scale)
-                                
-                pca_direction_grid[i,j,...] = pca_direction
+                #if pca_fitter.components_[0].sum() < 0:
+                #    T = True
+                #tprint("pca_selection", pca_selection, pca_selection.shape, t=T)
+                #tprint("flattened", flattened, flattened.shape, t=T)
+                #tprint(pca_fitter.components_[0], pca_fitter.components_[0].shape, t=T)
+                #tprint(pca_fitter.components_[1], t=T)
+                #tprint(i,j)
+                #if T:
+                #    return
+                for comp in range(num_components):
+                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, dataset.channels)
+
         pca_direction_grids.append(pca_direction_grid.copy())    
     return pca_direction_grids
     
-def pca_direction_grids(model, dataset, target_class, img, 
-                        sample_size=512, scales=None, 
-                        strides=None, pca_direction_grids=None,
-                       gaussian=False, device=None):
-    # begin by computing pca directions and d_output_d_alphas
+def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction_grids, 
+                        strides=None, gaussian=False, device=None, component=0, batch_size=32):
+    # begin by computing d_output_d_alphas
     model.eval()
     im_size = dataset.size
-    if scales is None:
-        scales = default_scales
     if strides is None:
-        strides = default_scales
+        strides = scales
     if isinstance(strides, int):
         strides = [strides]*len(pca_direction_grids)
-    if pca_direction_grids is None:
-        pca_direction_grids = find_pca_directions(dataset, sample_size, scales, strides)
     d_out_d_alpha_grids = []
     interpolators = []
     indices_grid = np.mgrid[0:im_size, 0:im_size]
-
-    for s, (scale, stride) in enumerate(zip(scales, strides)):
-        index_window = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))        
-        strided_indices = index_window[:, ::stride, ::stride]
         
-        xs = np.mgrid[scale:im_size:stride]
+    stacked_img = np.repeat(np.expand_dims(img, 0), batch_size, axis=0)
+    stacked_img = np.transpose(stacked_img, (0, 3, 1, 2)).astype(np.float32) # NCHW format
+    img_tensor = dataset.implicit_normalization(torch.tensor(stacked_img).to(device))
+    
+    for s, (scale, stride) in enumerate(zip(scales, strides)):
+        index_windows = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))        
+
+        xs = np.mgrid[scale:im_size:stride, scale:im_size:stride]
         num_grid = xs.shape[0]
         d_out_d_alpha_grid = np.zeros((num_grid, num_grid))
-        for i in tqdm(range(num_grid)):
-            for j in range(num_grid):
-                # get pca direction for current patch
-                pca_direction = pca_direction_grids[s][i,j]
-                indices = strided_indices[:, i, j, ...]  # will have to slice these
+        
+        strided_indices = xs.transpose(1,2,0).reshape(-1, 2)  # ie should always pass strides=1 pca_directions into this
+        unstrided_indices = np.mgrid[:num_grid, :num_grid].transpose(1,2,0).reshape(-1, 2)
+        for k in tqdm(range(0, num_grid*num_grid, batch_size)):
+            actual_batch_size = min(batch_size, num_grid*num_grid-k)
+            batch_locs = strided_indices[k: k+actual_batch_size]  # for indexing into a full image (im_size, im_size), which we do with strides
+            batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]  # for indexing into a dense grid (num_grid, num_grid)
 
-                # do d_output_d_alpha computation
-                alpha = torch.tensor(0.0, requires_grad=True).to(device)
-                direction_tensor = torch.tensor(pca_direction).to(device).float()
-                img_tensor = torch.tensor(img.transpose(2,0,1)).to(device).float().unsqueeze(0)
-                img_tensor[..., indices[0,0,0]:indices[0,-1,-1]+1, indices[1,0,0]:indices[1,-1,-1]+1] += alpha*direction_tensor
-                output = model(img_tensor)[0,target_class]
-                d_out_d_alpha = torch.autograd.grad(output, alpha)[0]
-                # try guided backprop
-                d_out_d_alpha_grid[i,j] = d_out_d_alpha.detach().cpu().numpy()
+            pca_directions = pca_direction_grids[s][batch_locs[:,0], batch_locs[:,1], component]
+            batch_window_indices = index_windows[:, batch_locs[:,0], batch_locs[:,1], ...]
+
+            # do d_output_d_alpha computation
+            alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(device)
+            direction_tensor = dataset.implicit_normalization(torch.tensor(pca_directions).to(device).float())
+            img_tensor[np.arange(actual_batch_size)[:,None,None], :, window_indices[0], window_indices[1]] += alpha*direction_tensor
+            output = model(img_tensor)  # sum since gradient will be back-proped as vector of 1`s
+
+            d_out_d_alpha = torch.autograd.grad(output[:,target_class].sum(), alpha)[0].squeeze()
+            model.zero_grad()
+            d_out_d_alpha_grid[batch_unstrided_locs[:,0], batch_unstrided_locs[:,1]] = d_out_d_alpha.detach().cpu().numpy()
+        
         d_out_d_alpha_grids.append(d_out_d_alpha_grid.copy())
-        interpolators.append(RegularGridInterpolator((xs, xs), d_out_d_alpha_grid, 
+        interpolators.append(RegularGridInterpolator((xs[0], xs[1]), d_out_d_alpha_grid, 
                                                      bounds_error=False, fill_value=None))
     # now, per pixel, interpolate what the d_output_d_alpha value would be if the window
     # were centered at that pixel, then take the max over all possible scales
-    saliency_map = np.zeros_like(img)
+    saliency_map = np.zeros_like(img).astype(np.float32)
     scale_wins = [0] * len(scales)
     for i in tqdm(range(im_size)):
         for j in range(im_size):
@@ -110,14 +128,30 @@ def pca_direction_grids(model, dataset, target_class, img,
     print(scale_wins)
     return saliency_map  # try jacobian with respect to window itself (isnt this just the gradient?)
 
-def visualize_pca_directions(pca_direction_grid_scales):
-    plt.figure(figsize=(len(pca_direction_grid)*4, 12))
-    for i, res in enumerate(pca_directions_grid_scales):
-        compressed_results = np.concatenate(np.concatenate(res, 1), 1)
-        plt.subplot(1,len(pca_directions_grid_scales),i+1)
-        if i == 0:
-            plt.title("Strided windows")
-        plt.imshow(compressed_results, cmap="gray")
+def visualize_pca_directions(pca_direction_grid_scales, title, scales, component=0, lines=True):
+    window_shape = pca_direction_grid_scales[0][0,0].shape
+    if len(window_shape) == 4:
+        num_channels = window_shape[-1]
+    else:
+        num_channels = 1
+    num_scales = len(pca_direction_grid_scales)
+    plt.figure(figsize=(5*num_scales, 6*num_channels))
+    plt.title(title)
+    for channel in range(num_channels):
+        for i, res in enumerate(pca_direction_grid_scales):
+            compressed_results = np.concatenate(np.concatenate(res[:, :, component, :, :, channel], 1), 1)
+            img_size = compressed_results.shape[0]
+            #print("doing", i, channel, "drawing", list(range(scales[i], img_size, scales[i])))
+            plt.subplot(num_channels, num_scales, num_scales*channel+i+1)
+            imshow_centered_colorbar(compressed_results, "bwr", f"Scale {scales[i]} Channel {channel}")
+            if lines:
+                plt.vlines(list(range(scales[i], img_size, scales[i])), linestyle="dotted",
+                        ymin=0, ymax=img_size, colors="k")
+                plt.hlines(list(range(scales[i], img_size, scales[i])), linestyle="dotted",
+                        xmin=0, xmax=img_size, colors="k")
+                plt.xlim(0,img_size)
+                plt.ylim(0,img_size)
+
 
 
 # Finite differences stuff
@@ -126,13 +160,7 @@ def visualize_pca_directions(pca_direction_grid_scales):
 
 @torch.no_grad()
 def finite_differences(model, dataset, target_class, stacked_img, locations, channel, 
-        unfairness, values_prior, num_values, device):
-    cuda_stacked_img = torch.tensor(stacked_img).to(device)
-    if dataset.num_classes == 2:
-        class_multiplier = 1 if target_class == 1 else -1
-        baseline_activations = class_multiplier*model(cuda_stacked_img, logits=True)
-    else:
-        baseline_activations = model(cuda_stacked_img)[:, target_class]
+        unfairness, values_prior, num_values, device, baseline_activations):
     largest_slope = np.zeros(stacked_img.shape[0])  # directional finite difference?
     slices = np.index_exp[np.arange(stacked_img.shape[0]), channel, locations[:, 0], locations[:, 1]]
     if values_prior is None:
@@ -151,7 +179,7 @@ def finite_differences(model, dataset, target_class, stacked_img, locations, cha
             shift_img[slices] = 0.01 + np.choose(closest, values_prior) - 10*np.sign(np.choose(closest, critical_value_dists))
 
         actual_diffs = shift_img[slices] - stacked_img[slices]
-        img_norm = torch.tensor(shift_img).to(device) # best is no normalization anyway
+        img_norm = dataset.implicit_normalization(torch.tensor(shift_img).to(device)) # best is no normalization anyway
         if dataset.num_classes == 2:
             activations = class_multiplier*model(img_norm, logits=True)
         else:
@@ -167,18 +195,26 @@ def finite_differences_map(model, dataset, target_class, img,
     model.eval()
     im_size = dataset.size
     #img = img.astype(np.float32)/255. # normalization handled later
-    values_x = np.repeat(np.arange(im_size), im_size)
-    values_y = np.tile(np.arange(im_size), im_size)
-    indices = np.stack((values_x, values_y), axis=1)
+    indices = np.mgrid[:im_size, :im_size].transpose(1,2,0).reshape(im_size*im_size, -1)
     stacked_img = np.repeat(np.expand_dims(img, 0), batch_size, axis=0)
     stacked_img = np.transpose(stacked_img, (0, 3, 1, 2)).astype(np.float32) # NCHW format
-    img_heat_map = np.zeros_like(img)
+    img_heat_map = np.zeros_like(img).astype(np.float32)
+    
+    with torch.no_grad():
+        cuda_stacked_img = dataset.implicit_normalization(torch.tensor(stacked_img).to(device))
+        if dataset.num_classes == 2:
+            class_multiplier = 1 if target_class == 1 else -1
+            baseline_activations = class_multiplier*model(cuda_stacked_img, logits=True)
+        else:
+            baseline_activations = model(cuda_stacked_img)[:, target_class]
+        del cuda_stacked_img
+
     for channel in range(dataset.channels):
         for k in tqdm(range(0, im_size*im_size, batch_size)):
-            actual_batch_size = min(batch_size, im_size*im_size-k+batch_size)
-            locations = indices[k:k+batch_size]
-            largest_slopes = finite_differences(model, dataset, target_class, 
-                    stacked_img, locations, channel, unfairness, values_prior, num_values, device)
+            actual_batch_size = min(batch_size, im_size*im_size-k)
+            locations = indices[k:k+actual_batch_size]
+            largest_slopes = finite_differences(model, dataset, target_class, stacked_img[:actual_batch_size],
+                    locations, channel, unfairness, values_prior, num_values, device, baseline_activations[:actual_batch_size])
             img_heat_map[locations[:,0], locations[:,1], channel] = largest_slopes
     return img_heat_map#.sum(axis=2)  # linear approximation aggregation?
 
@@ -227,9 +263,8 @@ def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=No
     for color in counterfactual_color_values:
         np.random.seed(test_index)
         generated_img, lbl, *__ = dataset.generate_one(set_color=color)
-        generated_img = np.expand_dims(generated_img, 0).transpose(0, 3, 1, 2)
-        generated_img = torch.tensor(generated_img).to(device).float()
-        response = net(torch.tensor(generated_img).to(device).float(), logits=True).cpu().numpy()
+        generated_img = tensorize(generated_img, device)
+        response = net(generated_img, logits=True).cpu().numpy()
         responses.append(np.squeeze(response))
 
     responses = np.asarray(responses)
