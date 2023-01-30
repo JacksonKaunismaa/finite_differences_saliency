@@ -27,14 +27,16 @@ class HookAdder(nn.Module):
     def clean_up(self):
         for handle in self.handles:
             handle.remove()
-        del handles
+        self.handles.clear()
         self.hooks_exist = False
 
     def forward(self, *args, preserve_hooks=False):
         self.setup_hooks()
-        result = self.model(*args)
-        if not preserve_hooks:
-            self.clean_up()
+        try:
+            result = self.model(*args)
+        finally:
+            if not preserve_hooks:
+                self.clean_up()
         return result
 
 class ProfileExecution(HookAdder):
@@ -73,9 +75,9 @@ class GuidedBackprop(HookAdder):
         def _relu_backward_hook(module, grad_in, grad_out):
             if not isinstance(module, nn.ReLU):  # only consider ReLUs
                 return
-            print("R^{l+1} is", grad_in[0], abs(grad_in[0]).max())
+            #print("R^{l+1} is", grad_in[0], abs(grad_in[0]).max())
             corresponding_forward_output = self.forward_relu_outputs[-1]
-            print("activations were",  corresponding_forward_output)
+            #print("activations were",  corresponding_forward_output)
             # technicall this still works since it is the output of a ReLU
             #corresponding_forward_output[corresponding_forward_output > 0] = 1
             modified_grad_out = torch.clamp(grad_in[0], min=0.0)

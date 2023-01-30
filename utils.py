@@ -50,12 +50,13 @@ def plt_grid_figure(grid, titles=None, colorbar=True, cmap=None, transpose=False
     plt.show()
 
 
-def imshow_centered_colorbar(img, cmap, title, colorbar=True):
+def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True):
     heat_max = np.max(abs(img))
     plt.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max)
     if colorbar:
         plt.colorbar(fraction=0.046, pad=0.04)
-    plt.title(title)
+    if title:
+        plt.title(title)
 
 
 def tensorize(inpt, device, requires_grad=False):

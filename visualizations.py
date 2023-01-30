@@ -26,12 +26,11 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
         strides = [strides]*len(scales)
     
     pca_direction_grids = []
-    T = False
     for scale, stride in zip(scales, strides):
         windows = np.lib.stride_tricks.sliding_window_view(sample, (scale,scale), axis=(1,2))
         strided_windows = windows[:, ::stride, ::stride, :]  # [N, H, W, C]
                 
-        xs = np.mgrid[scale:im_size:stride]
+        xs = np.mgrid[scale:im_size:stride]  # technically wrong (but its shape is correct)
         num_grid = xs.shape[0]
         pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, dataset.channels))
         
@@ -39,30 +38,78 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
         scale_fitter = StandardScaler()
         for i in tqdm(range(num_grid)):
             for j in range(num_grid):
-                # find pca direction for current patch
-                #if i == 0 and j == 7 and scale == 3:
-                #    T = True
                 pca_selection = strided_windows[:, i, j, :]
                 flattened = pca_selection.reshape(sample_size, -1)
                 normalized = scale_fitter.fit_transform(flattened)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")  # gives pointless zero-division warnings
                     pca_fitter.fit(normalized)
-                #if pca_fitter.components_[0].sum() < 0:
-                #    T = True
-                #tprint("pca_selection", pca_selection, pca_selection.shape, t=T)
-                #tprint("flattened", flattened, flattened.shape, t=T)
-                #tprint(pca_fitter.components_[0], pca_fitter.components_[0].shape, t=T)
-                #tprint(pca_fitter.components_[1], t=T)
-                #tprint(i,j)
-                #if T:
-                #    return
                 for comp in range(num_components):
                     pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, dataset.channels)
 
         pca_direction_grids.append(pca_direction_grid.copy())    
     return pca_direction_grids
-    
+
+def old_old_pca_direction_grids(model, dataset, target_class, img, 
+                        sample_size=512, scales=[3,5,9,15], 
+                        strides=None, pca_direction_grids=None,
+                       gaussian=False, device=None):
+    # begin by computing pca directions and d_output_d_alphas
+    model.eval()
+    im_size = dataset.size
+    if strides is None:
+        strides = scales
+    if pca_direction_grids is None:
+        pca_direction_grids = find_pca_directions(dataset, sample_size, scales, strides)
+    d_out_d_alpha_grids = []
+    interpolators = []
+    indices_grid = np.mgrid[0:im_size, 0:im_size]
+
+    for s, (scale, stride) in enumerate(zip(scales, strides)):
+        index_window = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))        
+        strided_indices = index_window[:, ::stride, ::stride]
+        
+        xs = np.mgrid[0:im_size-scale:stride]
+        num_grid = xs.shape[0]
+        #print(xs, num_grid)
+        d_out_d_alpha_grid = np.zeros((num_grid, num_grid))
+        for i in tqdm(range(num_grid)):
+            for j in range(num_grid):
+                # get pca direction for current patch
+                pca_direction = pca_direction_grids[s][i,j,0].transpose(2,0,1)
+                indices = strided_indices[:, i, j, ...]  # will have to slice these
+
+                # do d_output_d_alpha computation
+                alpha = torch.tensor(0.0, requires_grad=True).to(device)
+                direction_tensor = torch.tensor(pca_direction).to(device).float().unsqueeze(0)
+                img_tensor = torch.tensor(img.transpose(2,0,1)).to(device).float().unsqueeze(0)
+                img_tensor[..., indices[0,0,0]:indices[0,-1,-1]+1, indices[1,0,0]:indices[1,-1,-1]+1] += alpha*direction_tensor
+                output = model(img_tensor)[0,target_class]
+                d_out_d_alpha = torch.autograd.grad(output, alpha)[0]
+                
+                d_out_d_alpha_grid[i,j] = d_out_d_alpha.detach().cpu().numpy()
+        d_out_d_alpha_grids.append(d_out_d_alpha_grid.copy())
+        interpolators.append(RegularGridInterpolator((xs+scale//2, xs+scale//2), d_out_d_alpha_grid, 
+                                                     bounds_error=False, fill_value=None))
+    #print(d_out_d_alpha_grids[-1], d_out_d_alpha_grids[-1].shape)
+    # now, per pixel, interpolate what the d_output_d_alpha value would be if the window
+    # were centered at that pixel, then take the max over all possible scales
+    saliency_map = np.zeros_like(img)
+    scale_wins = [0] * len(scales)
+    for i in tqdm(range(im_size)):
+        for j in range(im_size):
+            best_d_out_d_alpha = 0
+            best_scale = -1
+            for s in range(len(scales)):
+                interp_value = interpolators[s]([i,j])
+                if abs(interp_value) >= abs(best_d_out_d_alpha):
+                    best_d_out_d_alpha = interp_value
+                    best_scale = s
+            saliency_map[i,j] = best_d_out_d_alpha
+            scale_wins[best_scale] += 1
+    print(scale_wins)
+    return saliency_map
+   
 def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction_grids, 
                         strides=None, gaussian=False, device=None, component=0, batch_size=32):
     # begin by computing d_output_d_alphas
@@ -72,6 +119,7 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
         strides = scales
     if isinstance(strides, int):
         strides = [strides]*len(pca_direction_grids)
+
     d_out_d_alpha_grids = []
     interpolators = []
     indices_grid = np.mgrid[0:im_size, 0:im_size]
@@ -81,37 +129,46 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
     img_tensor = dataset.implicit_normalization(torch.tensor(stacked_img).to(device))
     
     for s, (scale, stride) in enumerate(zip(scales, strides)):
-        index_windows = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))        
+        # centers are [scale//2, ..., im_size-scale//2-1], num_windows = im_size-scale+1
+        # the -1 on the upper limit center c.f. the "last index" being im_size-1
+        # the num_windows is correct because `(im_size-scale//2-1) - (scale//2) = (im_size-2*(scale-1)/2-1) = im_size-scale`
+        # and num elements of the array is last-first+1
+        index_windows = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))  
 
-        xs = np.mgrid[scale:im_size:stride, scale:im_size:stride]
-        num_grid = xs.shape[0]
+        xs = np.mgrid[0:im_size-scale:stride, 0:im_size-scale:stride]  # indexes into pca_direction_grids
+        num_grid = xs.shape[1]
+        #print(xs, num_grid)
         d_out_d_alpha_grid = np.zeros((num_grid, num_grid))
         
         strided_indices = xs.transpose(1,2,0).reshape(-1, 2)  # ie should always pass strides=1 pca_directions into this
         unstrided_indices = np.mgrid[:num_grid, :num_grid].transpose(1,2,0).reshape(-1, 2)
         for k in tqdm(range(0, num_grid*num_grid, batch_size)):
             actual_batch_size = min(batch_size, num_grid*num_grid-k)
-            batch_locs = strided_indices[k: k+actual_batch_size]  # for indexing into a full image (im_size, im_size), which we do with strides
+            batch_locs = strided_indices[k: k+actual_batch_size]
             batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]  # for indexing into a dense grid (num_grid, num_grid)
 
             pca_directions = pca_direction_grids[s][batch_locs[:,0], batch_locs[:,1], component]
             batch_window_indices = index_windows[:, batch_locs[:,0], batch_locs[:,1], ...]
-
+            
             # do d_output_d_alpha computation
             alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(device)
             direction_tensor = dataset.implicit_normalization(torch.tensor(pca_directions).to(device).float())
-            img_tensor[np.arange(actual_batch_size)[:,None,None], :, window_indices[0], window_indices[1]] += alpha*direction_tensor
+            img_tensor[np.arange(actual_batch_size)[:,None,None], :, batch_window_indices[0], batch_window_indices[1]] += alpha*direction_tensor
             output = model(img_tensor)  # sum since gradient will be back-proped as vector of 1`s
-
+            
             d_out_d_alpha = torch.autograd.grad(output[:,target_class].sum(), alpha)[0].squeeze()
             model.zero_grad()
             d_out_d_alpha_grid[batch_unstrided_locs[:,0], batch_unstrided_locs[:,1]] = d_out_d_alpha.detach().cpu().numpy()
         
         d_out_d_alpha_grids.append(d_out_d_alpha_grid.copy())
-        interpolators.append(RegularGridInterpolator((xs[0], xs[1]), d_out_d_alpha_grid, 
+        # add scale//2 because centers of windows are actually offset by scale//2, and don't directly correspond to indices into
+        # pca_direction_grid space
+        interpolators.append(RegularGridInterpolator((xs[1,0]+scale//2, xs[1,0]+scale//2), d_out_d_alpha_grid, 
                                                      bounds_error=False, fill_value=None))
+
     # now, per pixel, interpolate what the d_output_d_alpha value would be if the window
     # were centered at that pixel, then take the max over all possible scales
+    #print(d_out_d_alpha_grids[-1])
     saliency_map = np.zeros_like(img).astype(np.float32)
     scale_wins = [0] * len(scales)
     for i in tqdm(range(im_size)):
@@ -122,9 +179,9 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
                 interp_value = interpolators[s]([i,j])
                 if abs(interp_value) >= abs(best_d_out_d_alpha):
                     best_d_out_d_alpha = interp_value
-                    best_scale = scale
+                    best_scale = s
             saliency_map[i,j] = best_d_out_d_alpha
-            scale_wins[s] += 1
+            scale_wins[best_scale] += 1
     print(scale_wins)
     return saliency_map  # try jacobian with respect to window itself (isnt this just the gradient?)
 
@@ -280,3 +337,4 @@ def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=No
     plt.vlines([100, 150], np.min(responses), np.max(responses), linewidth=0.8,
                colors="r", label="decision boundary",
                linestyles="dashed") # with .eval() works well
+
