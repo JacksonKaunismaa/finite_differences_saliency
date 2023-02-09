@@ -65,16 +65,21 @@ class AllActivations(HookAdder):
 
 # adapted from https://github.com/utkuozbulak/pytorch-cnn-visualizations/blob/master/src/guided_backprop.py
 class GuidedBackprop(HookAdder):
-    def __init__(self, model):
+    def __init__(self, model, exceptions=None):
         self.forward_relu_outputs = []
         self.hook_types = ["register_backward_hook", "register_forward_hook"]
         self.hook_funcs = ["relu_backward_hook_creater", "relu_forward_hook_creater"]
+        self.exceptions = []
+        if exceptions:
+            self.exceptions = exceptions
         super().__init__(model)
     
     def relu_backward_hook_creater(self, name):
+        #print("potentiall adding to", name)
         def _relu_backward_hook(module, grad_in, grad_out):
-            if not isinstance(module, nn.ReLU):  # only consider ReLUs
+            if not isinstance(module, nn.ReLU) or name in self.exceptions:  # only consider ReLUs
                 return
+            #print("guided_backprop on", name)
             #print("R^{l+1} is", grad_in[0], abs(grad_in[0]).max())
             corresponding_forward_output = self.forward_relu_outputs[-1]
             #print("activations were",  corresponding_forward_output)
@@ -88,7 +93,7 @@ class GuidedBackprop(HookAdder):
     
     def relu_forward_hook_creater(self, name):
         def _relu_forward_hook(module, inpt, outpt):
-            if not isinstance(module, nn.ReLU):
+            if not isinstance(module, nn.ReLU) or name in self.exceptions:
                 return
             self.forward_relu_outputs.append(outpt)
         return _relu_forward_hook

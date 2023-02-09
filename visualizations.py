@@ -185,29 +185,27 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
     print(scale_wins)
     return saliency_map  # try jacobian with respect to window itself (isnt this just the gradient?)
 
-def visualize_pca_directions(pca_direction_grid_scales, title, scales, component=0, lines=True):
+def visualize_pca_directions(pca_direction_grid_scales, title, scales, lines=True):
     window_shape = pca_direction_grid_scales[0][0,0].shape
+    num_components = window_shape[0]
     if len(window_shape) == 4:
         num_channels = window_shape[-1]
     else:
         num_channels = 1
     num_scales = len(pca_direction_grid_scales)
-    plt.figure(figsize=(5*num_scales, 6*num_channels))
+    print("Components:", num_components)
+    print("Channels:", num_channels)
+    print("Scales:", num_scales)
+    plt.figure(figsize=(5*num_scales, 6*num_channels*num_components))
     plt.title(title)
-    for channel in range(num_channels):
-        for i, res in enumerate(pca_direction_grid_scales):
-            compressed_results = np.concatenate(np.concatenate(res[:, :, component, :, :, channel], 1), 1)
-            img_size = compressed_results.shape[0]
-            #print("doing", i, channel, "drawing", list(range(scales[i], img_size, scales[i])))
-            plt.subplot(num_channels, num_scales, num_scales*channel+i+1)
-            imshow_centered_colorbar(compressed_results, "bwr", f"Scale {scales[i]} Channel {channel}")
-            if lines:
-                plt.vlines(list(range(scales[i], img_size, scales[i])), linestyle="dotted",
-                        ymin=0, ymax=img_size, colors="k")
-                plt.hlines(list(range(scales[i], img_size, scales[i])), linestyle="dotted",
-                        xmin=0, xmax=img_size, colors="k")
-                plt.xlim(0,img_size)
-                plt.ylim(0,img_size)
+    for component in range(num_components):
+        for channel in range(num_channels):
+            for i, res in enumerate(pca_direction_grid_scales):
+                compressed_results = np.concatenate(np.concatenate(res[:, :, component, :, :, channel], 1), 1)
+                subplot_idx = (component*num_scales*num_channels) + (num_scales*channel) + i+1 
+                plt.subplot(num_channels*num_components, num_scales, subplot_idx)
+                line_width = scales[i] if lines else 0
+                imshow_centered_colorbar(compressed_results, "bwr", f"Scale {scales[i]} Channel {channel} Component {component}", line_width=line_width)
 
 
 
