@@ -2,6 +2,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+
+def remove_borders(ax, borders=None):
+    if borders is None:
+        borders = ["top", "bottom", "right", "left"]
+    for border in borders:
+        ax.spines[border].set_visible(False)
+
+
+def find_good_ratio(size): # find ratio as close to a square as possible
+    start_width = int(np.sqrt(size))
+    for width in range(start_width+1, 0, -1):
+        if size % width == 0:
+            break
+    height = size//width
+    return min(height, width), max(height, width)  # height, width
+
+
 def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None, 
         channel_mode=None):
     #np_grid = np.array(grid).squeeze()
@@ -82,25 +99,32 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
     plt.show()
 
 
-def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True, num_lines=0, line_width=0):
+def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True, num_lines=0, line_width=0, ax=None, rm_border=False):
+    if ax is None:
+        ax = plt.gca()
     heat_max = np.max(abs(img))
-    plt.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max)
+    img_width, img_height = img.shape[1], img.shape[0]
+    im = ax.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max, extent=(0,img_width,0,img_height))
+    
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if rm_border:
+        remove_borders(ax)
+    
     if colorbar:
-        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.colorbar(im, fraction=0.046, pad=0.04)
     if title:
-        plt.title(title)
-    if num_lines or line_width:
-        img_size = img.shape[0]
-        
+        ax.set_title(title)
+    if num_lines or line_width:  # num lines assumes equal in both directions
         if not line_width:
-            line_width = img_size // num_lines
+            line_width = img_width // num_lines
 
-        plt.vlines(list(range(line_width, img_size, line_width)), linestyle="dotted",
-            ymin=0, ymax=img_size, colors="k")
-        plt.hlines(list(range(line_width, img_size, line_width)), linestyle="dotted",
-            xmin=0, xmax=img_size, colors="k")
-        plt.xlim(0,img_size)
-        plt.ylim(0,img_size)
+        ax.vlines(list(range(line_width, img_width, line_width)), linestyle="dotted",
+            ymin=0, ymax=img_height, colors="k")
+        ax.hlines(list(range(line_width, img_height, line_width)), linestyle="dotted",
+            xmin=0, xmax=img_width, colors="k")
+        ax.set_xlim(0,img_width)
+        ax.set_ylim(0,img_height)
 
 
 def tensorize(inpt, device, requires_grad=False):

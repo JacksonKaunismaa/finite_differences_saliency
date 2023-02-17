@@ -1,4 +1,5 @@
 data/*
+logs/*
 *.pkl
 *.dict
 .ipynb_checkpoints

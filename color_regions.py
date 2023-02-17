@@ -122,7 +122,7 @@ class ColorDatasetGenerator(Dataset):
         image, label, color, _, __ = self.generate_one()
         if hasattr(self, "transform"):
             image = self.transform(image)
-        sample = {'image': image, 'label': label, 'color': color}
+        sample = {'image': image, 'label': label, 'color': color, "seeds": idx}
         return sample
 
     def implicit_normalization(self, inpt):

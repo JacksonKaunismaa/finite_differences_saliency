@@ -5,11 +5,12 @@ from scipy.interpolate import RegularGridInterpolator
 import torch
 from tqdm import tqdm
 from network import correct  # for rate_distribution (reads it as a global variable)
+from hooks import AllActivations
 import utils
 from utils import *
 import matplotlib.pyplot as plt
 import warnings
-
+from collections import defaultdict
 
 # PCA Stuff
 
@@ -205,7 +206,36 @@ def visualize_pca_directions(pca_direction_grid_scales, title, scales, lines=Tru
                 subplot_idx = (component*num_scales*num_channels) + (num_scales*channel) + i+1 
                 plt.subplot(num_channels*num_components, num_scales, subplot_idx)
                 line_width = scales[i] if lines else 0
-                imshow_centered_colorbar(compressed_results, "bwr", f"Scale {scales[i]} Channel {channel} Component {component}", line_width=line_width)
+                imshow_centered_colorbar(compressed_results, "bwr", 
+                        f"Scale {scales[i]} Channel {channel} Component {component}", line_width=line_width)
+
+
+def generate_many_pca(net, seeds, pca_directions_1_stride, scales, dataset, 
+        component=0, batch_size=128, strides=None, skip_1_stride=False, device=None):
+    _pca_map_s_strides = []
+    _pca_map_1_strides = []
+    _grad_maps = []
+    _explain_imgs = []
+    if strides is None:
+        strides = scales
+    for seed in seeds:
+        np.random.seed(seed)
+        generated_img, label, *__ = dataset.generate_one()
+        tensored_img = utils.tensorize(generated_img, device=device, requires_grad=True)
+        grad_map = torch.autograd.grad(net(tensored_img)[0,label.argmax()], tensored_img)[0]
+        pca_map_strided = pca_direction_grids(net, dataset, label.argmax(), generated_img,
+                                              scales, pca_directions_1_stride, strides=strides,
+                                              device=device, batch_size=batch_size, component=component)
+        if not skip_1_stride:
+            pca_map_1_stride = pca_direction_grids(net, dataset, label.argmax(), generated_img,
+                                              scales, pca_directions_1_stride, component=component,
+                                              device=device, batch_size=batch_size, strides=1)
+        _explain_imgs.append(generated_img)
+        _grad_maps.append(grad_map.detach().cpu().squeeze(0).numpy().transpose(1,2,0))
+        _pca_map_s_strides.append(pca_map_strided.copy())
+        if not skip_1_stride:
+            _pca_map_1_strides.append(pca_map_1_stride.copy())
+    return _pca_map_s_strides, _pca_map_1_strides, _grad_maps, _explain_imgs
 
 
 
@@ -336,3 +366,346 @@ def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=No
                colors="r", label="decision boundary",
                linestyles="dashed") # with .eval() works well
 
+
+
+# Mechanistic Interpretation
+
+
+
+def compute_profile_plot(profile, dataset):
+    avg_line = []
+    start = 0
+    for c in range(255):
+        if np.any(profile[:,0]==c):
+            avg_line.append(profile[:,1][profile[:,0]==c].mean())
+        else:
+            if avg_line:
+                avg_line.append(avg_line[-1]) # assume previous value continues
+            else:
+                start += 1  # or just start elsewhere
+    avg_line = np.asarray(avg_line)
+ 
+    color_values = np.arange(start, 255)
+    classes = np.vectorize(dataset.color_classifier)(color_values)/(dataset.num_classes-1)
+    return avg_line, color_values, classes, profile
+
+
+def get_profile_y_lims(profile_plot):
+    avg_line, color_values, classes, profile = profile_plot
+    max_y = min(max(avg_line)*1.3, max(profile[:,1]))
+    min_y = max(min(avg_line)*(1-0.3*np.sign(min(avg_line))), min(profile[:,1]))
+    return min_y, max_y
+
+
+def show_profile_plot(profile_plot, hide_ticks=False, ax=None, rm_border=False, y_lims=None):
+    if ax is None:
+        ax = plt.gca()
+    
+    avg_line, color_values, classes, profile = profile_plot
+    
+    if y_lims is None:
+        min_y, max_y = get_profile_y_lims(profile_plot)
+    else:
+        min_y, max_y = y_lims
+    scaled_classes = classes*(max_y-min_y) + min_y
+    
+    ax.scatter(profile[:,0], profile[:,1], s=0.5, marker="o", alpha=0.08)
+    ax.plot(color_values, avg_line, c="r")
+    ax.plot(color_values, scaled_classes, c="k", alpha=0.25)
+    
+    ax.set_ylim(min_y-(max_y-min_y)*0.01, max_y+(max_y-min_y)*0.01)
+    if hide_ticks:
+        ax.set_xticks([])
+    if rm_border:
+        remove_borders(ax, ["top", "bottom", "right"])#, "left"])
+
+
+def show_profile_plots(color_profile, names, hide_ticks=True, rm_border=True, fixed_height=False, size_mul=1.):
+    shape = find_good_ratio(len(names))
+    if not isinstance(size_mul, tuple):
+        size_mul = (size_mul, size_mul)
+
+    figsize = shape[1]*6*size_mul[1], shape[0]*6*size_mul[0]
+    
+    fig = plt.figure(figsize=figsize)#, constrained_layout=True)
+    
+    gs = fig.add_gridspec(shape[0], shape[1])
+    axes = gs.subplots()
+    if not isinstance(axes, np.ndarray):
+        axes = np.array(axes)[None, None]
+    if len(axes.shape) == 1:
+        axes = np.expand_dims(axes, 0)
+
+    min_min_y = np.inf
+    max_max_y = -np.inf
+    if fixed_height:
+        for name in names:
+            min_y, max_y = get_profile_y_lims(color_profile[name])
+            min_min_y = min(min_min_y, min_y)
+            max_max_y = max(max_max_y, max_y)
+        y_lims = (min_min_y, max_max_y)
+    else:
+        y_lims = None
+
+    for h in range(shape[0]):
+        for w in range(shape[1]):
+            name = w+h*shape[1]
+            show_profile_plot(color_profile[names[name]],
+                              hide_ticks=hide_ticks, ax=axes[h,w], rm_border=rm_border, y_lims=y_lims)
+
+
+@torch.no_grad()
+def activation_color_profile(net, loader, dataset, device=None):
+    # assume it already has AllActivations hooks on it
+    net.eval()
+    filter_activations = defaultdict(list) # conv filter: [(color, sum_squared_activations), ...]
+    for sample in tqdm(loader):
+        imgs = sample["image"].to(device).float()
+        labels = sample["label"].to(device).float()
+        colors = sample["color"]
+        net(imgs)
+
+        for layer_name, activation in net._features.items():
+            for i, color in enumerate(colors):
+                # ignore batchnorms, and pre-activation func
+                if "act_func" in layer_name: # happens to be identical implementation for fully_connected
+                    for channel in range(activation.shape[1]):
+                        entry = color.item(), activation[i][channel].sum().item() # could do group conv to give data on input channels?
+                        filter_activations[f"{layer_name}_{channel}"].append(entry)
+                else:
+                    break
+    filter_activations = {k:np.asarray(v) for k,v in filter_activations.items()}
+    profile_plots = {k:compute_profile_plot(filter_activations[k], dataset) for k in filter_activations.keys()}
+    return profile_plots, filter_activations
+
+
+def show_conv_layer(net, layer_name, shape=None):
+    # assume net it already has AllActivations hooks on it
+    features = net._features[layer_name].detach().cpu().numpy().squeeze() # CHW
+    if shape is None:
+        shape = find_good_ratio(features.shape[0])
+    height,width = shape
+    map_size = features.shape[-1]
+    grid_features = features.reshape(height, width, map_size, map_size)
+    stacked_features = np.concatenate(np.concatenate(grid_features, 1), 1)
+    plt.figure(figsize=(map_size*width/32*6, map_size*height/32*6))
+    imshow_centered_colorbar(stacked_features, title=layer_name, 
+                             line_width=map_size, colorbar=False, rm_border=True)
+
+
+def get_weight(net, weight_name):
+    if "conv_block" in weight_name:
+        infer_weight_name = weight_name.replace("act_func", "conv") # infer desired weights
+    else:
+        infer_weight_name = weight_name.replace("act_func", "fully_connected") # infer desired weights
+    attrs = infer_weight_name.split(".")
+
+    if hasattr(net, "model"):
+        curr_module = net.model
+    else:
+        curr_module = net
+
+    for attr in attrs:
+        try:
+            curr_module = curr_module[int(attr)]
+        except ValueError:
+            curr_module = getattr(curr_module, attr)
+    return curr_module.weight.detach().cpu().numpy()
+
+def show_fully_connected(net, weight_name):
+    pass
+
+def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, size_mul=6, rm_border=True, fixed_height=False):
+    # assume net it already has AllActivations hooks on it
+    # implicitly assume that channel-aligned view is salient for the given network
+    weights = get_weight(net, weight_name)   # N_out, N_in, K, K
+    if outer_shape is None:
+        outer_shape = find_good_ratio(weights.shape[0])
+    inner_shape = find_good_ratio(weights.shape[1])
+    map_size = weights.shape[-1]
+    def reshaper(w):
+        grid_w = w.reshape(*inner_shape, map_size, map_size)
+        return  np.concatenate(np.concatenate(grid_w, 1), 1)
+    show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul, rm_border, fixed_height)
+
+
+def show_fc_conv(net, weight_name="fully_connected.0.act_func", size_mul=1, color_profile=None, rm_border=True, selection=None, fixed_height=False):
+     # ie. the first fully connected layer
+    fc_weight = get_weight(net, weight_name) # out, in
+    if selection:
+        fc_weight = fc_weight[selection] # if only want to look at specific logits
+    final_img_shape = net.model.final_img_shape  # HWC
+    fc_out_shape = find_good_ratio(fc_weight.shape[0])
+    conv_shape = find_good_ratio(final_img_shape[2])
+    map_size = final_img_shape[0]
+    def reshaper(w):
+        grid_w = w.reshape(*conv_shape, map_size, map_size)
+        return  np.concatenate(np.concatenate(grid_w, 1), 1)
+    show_weights(fc_weight, weight_name, reshaper, conv_shape, fc_out_shape, map_size, color_profile, size_mul, rm_border, fixed_height, selection=selection)
+
+
+def show_fc(net, weight_name, size_mul=1, color_profile=None, rm_border=True, selection=None, fixed_height=False):
+    fc_weight = get_weight(net, weight_name) # out, in
+    if selection:
+        fc_weight = fc_weight[selection] # if only want to look at specific logits
+    logits_shape = find_good_ratio(fc_weight.shape[0])
+    def reshaper(w):
+        return w[None,:]
+    show_weights(fc_weight, weight_name, reshaper, (1,1), logits_shape, 1, color_profile, size_mul, rm_border, fixed_height, selection=selection)
+
+
+def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul, 
+        rm_border, fixed_height, selection=None): 
+    if selection is None:
+        selection = np.arange(outer_shape[0]*outer_shape[1])
+    if not isinstance(size_mul, tuple):
+        size_mul = (size_mul, size_mul)
+
+
+    figsize = map_size*outer_shape[1]*inner_shape[1]/8*size_mul[1], map_size*outer_shape[0]*inner_shape[0]/8*size_mul[0]
+    if color_profile:
+        figsize = figsize[0], figsize[1]*2
+    fig = plt.figure(figsize=figsize)#, constrained_layout=True)
+    #plt.suptitle(weight_name)
+    if color_profile:
+        gs = fig.add_gridspec(outer_shape[0]*2, outer_shape[1], hspace=0)
+    else:
+        gs = fig.add_gridspec(outer_shape[0], outer_shape[1])
+    axes = gs.subplots()
+    if not isinstance(axes, np.ndarray):
+        axes = np.array(axes)[None, None]
+    if len(axes.shape) == 1:
+        axes = np.expand_dims(axes, 1 if outer_shape[0] == 1 and color_profile else 0)
+    #print(axes.shape)
+
+    min_min_y = np.inf
+    max_max_y = -np.inf
+    if color_profile and fixed_height:
+        for item in selection:
+            min_y, max_y = get_profile_y_lims(color_profile[f"{weight_name}_{item}"])
+            min_min_y = min(min_min_y, min_y)
+            max_max_y = max(max_max_y, max_y)
+        y_lims = (min_min_y, max_max_y)
+    else:
+        y_lims = None
+
+    for h in range(outer_shape[0]):
+        for w in range(outer_shape[1]):
+            channel = w+h*outer_shape[1]
+            gs_idx = (h*2,w) if color_profile else (h,w)
+            imshow_centered_colorbar(reshaper(weights[channel]), line_width=map_size if map_size > 1 else 0,
+                                     colorbar=False, ax=axes[gs_idx], rm_border=rm_border)
+            if color_profile:
+                gs_idx = h*2+1, w
+                show_profile_plot(color_profile[f"{weight_name}_{selection[channel]}"],
+                                  hide_ticks=True, ax=axes[gs_idx], rm_border=True, y_lims=y_lims)
+
+
+# Network training curve plots
+
+
+def defaultdict_helper():  # to make things pickle-able
+    return defaultdict(int)
+
+
+def final_activation_tracker(net, loss, optimizer, loader, device=None):
+    # final hidden layer activations
+    net.eval()
+    final_fc_name = f"fully_connected.{len(net.fully_connected)-2}."
+    post_relu_name = final_fc_name+"act_func"
+    pre_relu_name = final_fc_name+"fully_connected"
+    debug_net = hooks.AllActivations(net)
+
+    nonzero_histogram = torch.zeros(net.final_hidden).to(device)
+    pattern_counts = defaultdict(defaultdict_helper)
+    
+    post_relu_activations = []
+    pre_relu_activations = []
+    final_outputs = []
+    post_relu_grads = []
+    pre_relu_grads = []
+    for i, sample in tqdm(enumerate(loader)):
+        imgs = sample["image"].to(device).float()
+        labels = sample["label"].to(device)
+        colors = sample["color"]
+        output = debug_net(imgs)
+        batch_loss = loss(output, labels)
+        
+        post_relu_acts = debug_net._features[post_relu_name]
+        pre_relu_acts = debug_net._features[pre_relu_name]
+        post_relu_grad = torch.autograd.grad(batch_loss, post_relu_acts)[0]
+        nonzero_mask = torch.where(post_relu_acts > 0, 1, 0)
+        pre_relu_grad = post_relu_grad*nonzero_mask
+        #input("post access")
+        post_relu_activations.append(post_relu_acts.detach().cpu().numpy())
+        pre_relu_activations.append(pre_relu_acts.detach().cpu().numpy())
+        final_outputs.append(output.detach().cpu().numpy())
+        post_relu_grads.append(post_relu_grad.detach().cpu().numpy())
+        pre_relu_grads.append(pre_relu_grad.detach().cpu().numpy())
+        #input("post append")
+        #track patterns
+        nonzero = nonzero_mask.detach().cpu().numpy()
+        for row, color in zip(nonzero, colors):
+            pattern = str(row)
+            pattern_counts[int(color)][pattern] += 1
+
+
+    output_sample = np.concatenate(final_outputs, axis=0)
+    pre_relu_sample = np.concatenate(pre_relu_activations, axis=0)
+    post_relu_sample = np.concatenate(post_relu_activations, axis=0)
+    pre_corr = np.corrcoef(output_sample, pre_relu_sample, rowvar=False)[:3, 3:]
+    post_corr = np.corrcoef(output_sample, post_relu_sample, rowvar=False)[:3, 3:]
+    post_grad_avg = (np.concatenate(post_relu_grads, axis=0)**2).mean(axis=0)
+    pre_grad_avg = (np.concatenate(pre_relu_grads, axis=0)**2).mean(axis=0)
+    #input("end of stats")
+    del imgs, labels, colors
+    del debug_net._features
+    return pattern_counts, pre_corr, post_corr, pre_grad_avg, post_grad_avg
+
+
+def plot_results(result, network_name, fig_mul=1.5, size=0.2, alpha=0.5):
+    plt.figure(figsize=(6*fig_mul, 6*fig_mul))
+    plt.suptitle(network_name)
+    plt.subplot(3,2,1)
+    plt.title(f"Log(Loss) Curves")
+    plt.plot(np.log(result[0]), label="Valid")
+    plt.plot(np.log(result[2]), label="Train")
+    plt.xticks([])
+    plt.legend()
+    plt.subplot(3,2,2)
+    plt.title("Log(Num unique configurations of output logits used)")
+    plt.plot(np.log2(result[-1]))
+
+    colors = ["coral", "forestgreen", "royalblue"]
+    np_extra_stats = [np.stack([elem[t] for elem in result[-2]], axis=0) for t in range(1,5)]  # 4,100
+    pre_corr, post_corr, pre_grad_avg, post_grad_avg = np_extra_stats
+    num_hidden = pre_corr.shape[-1]
+    plt.subplot(3,2,3)
+    plt.title("Pre-ReLU abs(corr_coef) of logits")
+    for i, color in enumerate(colors):
+        for logit in range(num_hidden):
+            plt.plot(abs(pre_corr[:,i,logit]), c=color, linewidth=size, alpha=alpha)   # 100, 3, 32
+    plt.subplot(3,2,4)
+    plt.title("Post-ReLU abs(corr_coef) of logits")
+    for i, color in enumerate(colors):
+        for logit in range(num_hidden):
+            plt.plot(abs(post_corr[:,i,logit]), c=color, linewidth=size, alpha=alpha)
+    plt.subplot(3,2,5)
+    plt.title("Mean grad**2 of pre-relu logits")
+    for logit in range(num_hidden):
+        plt.plot(pre_grad_avg[:,logit], c=colors[-1], linewidth=size, alpha=alpha)  # 100, 32
+    plt.xlabel("Epoch")
+    plt.subplot(3,2,6)
+    plt.title("Mean grad**2 of post-relu logits")
+    for logit in range(num_hidden):
+        plt.plot(post_grad_avg[:,logit], c=colors[-1], linewidth=size, alpha=alpha)
+    plt.xlabel("Epoch")
+
+
+def count_logit_usage(pattern_counts): # num unique configurations
+    if isinstance(pattern_counts, tuple):
+        pattern_counts = pattern_counts[0]
+    uniq = set()
+    for x in pattern_counts.values(): 
+        uniq = uniq.union(set(x.keys()))
+    return len(uniq)

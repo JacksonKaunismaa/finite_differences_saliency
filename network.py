@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from tqdm import tqdm
 import os
+import pickle
 
 class ConvBlock(nn.Module):
     def __init__(self, inpt_shape, layer_params, groups, act_func):
@@ -61,6 +63,8 @@ class ResNet(nn.Module):
         self.conv_blocks = nn.ModuleList(conv_blocks)
 
         self.final_num_logits = img_shape[0] * img_shape[1] * img_shape[2]
+        self.final_img_shape = img_shape
+        self.final_hidden = fc_layers[-1]
         fully_connected = []
         fc_layers.insert(0, self.final_num_logits)
         fc_layers.append(num_classes)
@@ -86,6 +90,7 @@ class ResNet(nn.Module):
     def save_model_state_dict(self, path=None, optim=None):
         if path is None:
             path = self.path
+        path = os.path.join("models", path)
         if optim is not None:
             save_dict = {}
             save_dict["model"] = self.state_dict()
@@ -98,8 +103,11 @@ class ResNet(nn.Module):
         # convert old format
         if path is None:
             path = self.path
+        path = os.path.join("models", path)
         if not os.path.exists(path):
+            print("No existing model found", path)
             return
+        print("Found path of", path)
         load_dict = torch.load(path)
         
         if "model" in load_dict:
@@ -134,25 +142,31 @@ def correct(pred_logits, labels):
     correct = (labels_argmax == classifications)
     return correct
 
-def train(net, optimizer, loss, epochs, device=None):
+def train(net, optimizer, loss, epochs, train_loader, valid_loader, device=None, log_file=None, 
+        track_stat=None, summarize=None, test_loader=None):
     va_losses = []
     tr_losses = []
+    extra_stats = []
+    summary_stats = []
     va_accuracies = []
     for epoch in range(epochs):
         epoch_tr_loss = 0.0
         net.train()
+        #input("Entering train")
         for i, sample in tqdm(enumerate(train_loader)):
             imgs = sample["image"].to(device, non_blocking=False).float()
             labels = sample["label"].to(device).float()
-            optimizer.zero_grad()
             outputs = net(imgs)
             batch_loss = loss(outputs, labels)
             epoch_tr_loss += batch_loss.item()
             batch_loss.backward()
             optimizer.step()
+            optimizer.zero_grad()
         epoch_va_loss = 0.0
         epoch_va_correct = 0
         net.eval()
+        total_valid = 0
+        #input("Entering valid")
         with torch.no_grad():
             for i, sample in enumerate(valid_loader):
                 imgs = sample["image"].to(device).float()
@@ -160,11 +174,29 @@ def train(net, optimizer, loss, epochs, device=None):
                 outputs = net(imgs)
                 epoch_va_loss += loss(outputs, labels).item()
                 epoch_va_correct += correct(outputs, labels).sum().item()
-        epoch_va_accuracy = epoch_va_correct/(valid_indices[1] - valid_indices[0])
-        print(f'Epoch {epoch + 1}: va_loss: {epoch_va_loss}, va_accuracy: {epoch_va_accuracy}, tr_loss: {epoch_tr_loss}')
+                total_valid += labels.shape[0]
+        epoch_va_accuracy = epoch_va_correct/total_valid
+        epoch_summary = f'Epoch {epoch + 1}: va_loss: {epoch_va_loss}, va_accuracy: {epoch_va_accuracy}, tr_loss: {epoch_tr_loss}' 
+        #input("Entering extra")
+        if track_stat is not None:
+            loader = test_loader if test_loader is not None else valid_loader
+            curr_stat = track_stat(net, loss, optimizer, loader, device=device)
+            if summarize is not None:
+                summary_stat = summarize(curr_stat)
+            else:
+                summary_stat = curr_stat
+            extra_stats.append(curr_stat)
+            summary_stats.append(summary_stat)
+            epoch_summary += f", curr_stat: {summary_stat}"
+        print(epoch_summary)
         if not va_losses or epoch_va_loss < min(va_losses):
             net.save_model_state_dict(optim=optimizer)
         va_losses.append(epoch_va_loss)
         tr_losses.append(epoch_tr_loss)
         va_accuracies.append(epoch_va_accuracy)
-    return va_losses, va_accuracies, tr_losses
+        if log_file is not None:
+            with open(log_file, "wb") as p:
+                pickle.dump((va_losses, va_accuracies, tr_losses, extra_stats, summary_stats), p)
+    return va_losses, va_accuracies, tr_losses, extra_stats, summary_stats
+
+

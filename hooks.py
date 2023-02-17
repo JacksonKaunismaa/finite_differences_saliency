@@ -2,11 +2,14 @@ import torch
 import torch.nn as nn
 
 class HookAdder(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, **kwargs):
         super().__init__()
         self.model = model
         self.handles = []
         self.hooks_exist = False
+        self.verbose = False
+        for k,v in kwargs.items():
+            setattr(self, k, v)
         
     def setup_hooks(self):
         if self.hooks_exist:
@@ -20,7 +23,10 @@ class HookAdder(nn.Module):
                 for hook_type, hook_func in zip(self.hook_types, self.hook_funcs):
                     mod_hook = getattr(mod, hook_type)
                     generated_hook = getattr(self, hook_func)(curr_name[:-1])
-                    self.handles.append(mod_hook(generated_hook))
+                    if self.verbose:
+                        print("Adding", hook_func, "to", curr_name[:-1], "on", hook_type)
+                    if generated_hook:
+                        self.handles.append(mod_hook(generated_hook))
         recurse_modules(self.model)
         self.hooks_exist = True
     
@@ -40,7 +46,7 @@ class HookAdder(nn.Module):
         return result
 
 class ProfileExecution(HookAdder):
-    def __init__(self, model):
+    def __init__(self, model, **kwargs):
         self.hook_types = ["register_forward_hook"]
         self.hook_funcs = ["benchmark_hook"]
         super().__init__(model)
@@ -51,28 +57,40 @@ class ProfileExecution(HookAdder):
         return fn
 
 class AllActivations(HookAdder):
-    def __init__(self, model):
+    def __init__(self, model, track_grads=None, **kwargs):
         self._features = {}
+        self._grads = {}
         self.hook_types = ["register_forward_hook"]
         self.hook_funcs = ["save_activations_hook"]
-        super().__init__(model)
+        if track_grads:
+            self.track_grads = track_grads  # list of names
+            self.hook_types.append("register_backward_hook")
+            self.hook_funcs.append("save_grad_hook")
+        super().__init__(model, **kwargs)
             
     def save_activations_hook(self, name):
         def fn(layer, inpt, output):
             self._features[name] = output
         return fn
 
+    def save_grad_hook(self, name):
+        if name in self.track_grads: 
+            def fn(layer, grad_in, grad_out):
+                self._grads[name] = grad_out[0].detach().cpu().numpy()
+            return fn
+        return None
+
 
 # adapted from https://github.com/utkuozbulak/pytorch-cnn-visualizations/blob/master/src/guided_backprop.py
 class GuidedBackprop(HookAdder):
-    def __init__(self, model, exceptions=None):
+    def __init__(self, model, exceptions=None, **kwargs):
         self.forward_relu_outputs = []
         self.hook_types = ["register_backward_hook", "register_forward_hook"]
         self.hook_funcs = ["relu_backward_hook_creater", "relu_forward_hook_creater"]
         self.exceptions = []
         if exceptions:
             self.exceptions = exceptions
-        super().__init__(model)
+        super().__init__(model, **kwargs)
     
     def relu_backward_hook_creater(self, name):
         #print("potentiall adding to", name)
