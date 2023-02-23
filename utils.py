@@ -19,7 +19,7 @@ def find_good_ratio(size): # find ratio as close to a square as possible
     return min(height, width), max(height, width)  # height, width
 
 
-def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None, 
+def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None,
         channel_mode=None):
     #np_grid = np.array(grid).squeeze()
     #if len(np_grid.shape) != 4:
@@ -30,7 +30,7 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
         inpt_grid = [inpt_grid]
     if cmap is None:
         cmap = "bwr"
-   
+
     nrows = len(inpt_grid[0]) if transpose else len(inpt_grid)
     if channel_mode not in ["split", "collapse"] and not isinstance(channel_mode, int) and channel_mode is not None:
         raise ValueError(f"Invalid value for channel_mode: '{channel_mode}'. Must be in ['split', 'collapse', int].")
@@ -44,7 +44,7 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
                 #print("on idx", i,j)
                 if idx[1] != 0 and img.ndim == 3:  # not in first column
                     #print("decided to do some expanding, curr_len", len(grid[idx[0]]))
-                    expanded_view = [channel_view for channel_view in img.transpose(2,0,1)] 
+                    expanded_view = [channel_view for channel_view in img.transpose(2,0,1)]
                     #print("expandend_amount", len(expanded_view))
                     grid[idx[0]] += expanded_view  # ie. assume HWC
                     if idx[0] == 0:  # in first row
@@ -57,7 +57,7 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
         titles = expanded_titles
     else:
         grid = inpt_grid
-    
+
     #print([len(x) for x in grid])
     im_size = grid[0][0].shape[0]
     ncols = len(grid) if transpose and not channel_mode == "split" else len(grid[0])
@@ -72,7 +72,7 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
     print(axes.shape)
     for i, row in enumerate(grid):
         for j, unsqueezed_img in enumerate(row):
-            img = unsqueezed_img.squeeze() 
+            img = unsqueezed_img.squeeze()
             idx = (j,i) if transpose and not channel_mode == "split" else (i,j)  # split_channels already accounts for transpose
             if idx[1] == 0: # assume explain_img is the first thing
                 if len(img.shape) == 3 and img.shape[2] == 3:
@@ -105,12 +105,12 @@ def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True, num_lin
     heat_max = np.max(abs(img))
     img_width, img_height = img.shape[1], img.shape[0]
     im = ax.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max, extent=(0,img_width,0,img_height))
-    
+
     ax.set_xticks([])
     ax.set_yticks([])
     if rm_border:
         remove_borders(ax)
-    
+
     if colorbar:
         plt.colorbar(im, fraction=0.046, pad=0.04)
     if title:
@@ -134,8 +134,8 @@ def tensorize(inpt, device, requires_grad=False):
         inpt = np.expand_dims(inpt.transpose(2,0,1), 0)
     elif len(inpt.shape) == 4:  # [batch, size, size, 1]
         inpt = inpt.transpose(0,3,1,2)
-   
-    if inpt.dtype == np.uint8: 
+
+    if inpt.dtype == np.uint8:
         inpt = inpt.astype(np.float32)/255.
     tensored = torch.tensor(inpt, requires_grad=requires_grad).to(device).float()
     return tensored
@@ -143,4 +143,4 @@ def tensorize(inpt, device, requires_grad=False):
 
 def tprint(*args, t=False, **kwargs):
     if t:
-        print(*args, **kwargs) 
+        print(*args, **kwargs)

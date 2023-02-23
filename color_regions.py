@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 import colorsys
 import imageio
@@ -17,7 +17,7 @@ class ColorDatasetGenerator(Dataset):
         # image parameters
         self.size = 256 # shape of image
         self.channels = 1  # default is greyscale
-        self.bg_color = 0  # must have same number of channels 
+        self.bg_color = 0  # must have same number of channels
 
         # target parameters
         self.color_classifier = None  # function that maps colors to classes (supports iterables)
@@ -28,7 +28,7 @@ class ColorDatasetGenerator(Dataset):
         self.value_range = (20, 100) # range for value in HSV (subset of (0, 100))
         self.saturation_range = (20, 100) # range for saturation in HSV (subset of (0, 100))
         self.hue_range = (0, 360)  # range for hue in HSV (subset of (0, 360))
-    
+
         self.radius = (self.size//6, self.size//3)  # range of possible radii for circles
         self.num_objects = 1 # supports ranges, if want multiclass
 
@@ -40,7 +40,9 @@ class ColorDatasetGenerator(Dataset):
         for k,v in kwargs.items():
             setattr(self, k, v)
             self.options.append(k)
-           
+        if self.num_classes == 2:
+            self.class_multiplier = lambda target_class: 1 if target_class == 1 else -1
+
     def iterative_color_cvt(self, conversion, iterable):
         # iterates over first dimension
         convert_func = getattr(colorsys, conversion)
@@ -58,7 +60,7 @@ class ColorDatasetGenerator(Dataset):
 
     def add_target(self, arr, set_color):
         num_objects = self.num_objects # np.random.randint(*self.num_objects)
-        
+
         if set_color is not None:
             color = np.array([set_color]*num_objects)
         else:
@@ -126,9 +128,9 @@ class ColorDatasetGenerator(Dataset):
         return sample
 
     def implicit_normalization(self, inpt):
-        # since ColorDatasetGenerator.generate_one returns np.float32, transforms.ToTensor() will implicitly assume we are already 
+        # since ColorDatasetGenerator.generate_one returns np.float32, transforms.ToTensor() will implicitly assume we are already
         #in [0,1] (even though we aren't), and won't do a divide by 255. Since we work in [0, 255] space for basically everything, and
-        # the ColorDatasetGenerator models take input in [0, 255] (due to ToTensor having assumed we were in [0,1]), we don't have to 
+        # the ColorDatasetGenerator models take input in [0, 255] (due to ToTensor having assumed we were in [0,1]), we don't have to
         # do anything here, and only exists because TextureDatasetGenerator actually requires us to do something here
         return inpt
 
@@ -203,8 +205,8 @@ class TextureDatasetGenerator(Dataset):
             imread = imageio.v2.imread(os.path.join(images_path, name))
 
             downsampled = scipy.ndimage.zoom(imread,
-                                              [self.size/imread.shape[0], self.size/imread.shape[1], 1.],
-                                              order=1)
+                                            [self.size/imread.shape[0], self.size/imread.shape[1], 1.],
+                                            order=1)
             self.textures.append(downsampled)
             self.texture_file_names.append(name)
             self.texture_labels.append(self.texname_to_idx[categ[0]])
