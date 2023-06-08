@@ -3,4 +3,7 @@ logs/*
 *.pkl
 *.dict
 .ipynb_checkpoints
-
+*.png
+*.pdf
+*.log
+wandb/

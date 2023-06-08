@@ -2,6 +2,15 @@ import torch
 import torch.nn as nn
 import time
 
+def traverse_modules(func, mod, curr_name="", **kwargs):
+    has_sub_mods = False
+    for name, sub_mod in mod.named_children():
+        traverse_modules(func, sub_mod, curr_name=f"{curr_name}{name}.", **kwargs)
+        has_sub_mods = True
+    if not has_sub_mods: # if no submodules, it is an actual operation
+        func(mod, curr_name, **kwargs)
+
+
 class HookAdder(nn.Module):
     def __init__(self, model, **kwargs):
         super().__init__()
@@ -15,20 +24,15 @@ class HookAdder(nn.Module):
     def setup_hooks(self):
         if self.hooks_exist:
             return
-        def recurse_modules(mod, curr_name=""):
-            has_sub_mods = False
-            for name, sub_mod in mod.named_children():
-                recurse_modules(sub_mod, f"{curr_name}{name}.")
-                has_sub_mods = True
-            if not has_sub_mods: # if no submodules, it is an actual operation
-                for hook_type, hook_func in zip(self.hook_types, self.hook_funcs):
-                    mod_hook = getattr(mod, hook_type)
-                    generated_hook = getattr(self, hook_func)(curr_name[:-1])
-                    if self.verbose:
-                        print("Adding", hook_func, "to", curr_name[:-1], "on", hook_type)
-                    if generated_hook:
-                        self.handles.append(mod_hook(generated_hook))
-        recurse_modules(self.model)
+        def add_hook(mod, curr_name, _self):
+            for hook_type, hook_func in zip(_self.hook_types, _self.hook_funcs):
+                mod_hook = getattr(mod, hook_type)
+                generated_hook = getattr(_self, hook_func)(curr_name[:-1])
+                if _self.verbose:
+                    print("Adding", hook_func, "to", curr_name[:-1], "on", hook_type)
+                if generated_hook:
+                    _self.handles.append(mod_hook(generated_hook))
+        traverse_modules(add_hook, self.model, _self=self)
         self.hooks_exist = True
 
     def clean_up(self):
@@ -148,4 +152,16 @@ class GuidedBackprop(HookAdder):
             if not isinstance(module, nn.ReLU) or name in self.exceptions:
                 return
             self.forward_relu_outputs.append(outpt)
-        return _relu_forward_hook
+
+def set_initializers(mod, gain):
+    has_sub_mods = False
+    for name, sub_mod in mod.named_children():
+        set_initializers(sub_mod, gain)
+        has_sub_mods = True
+    if not has_sub_mods: # if no submodules, it is an actual operation
+        if hasattr(mod, "weight"):
+            try:
+                torch.nn.init.xavier_normal_(mod.weight, gain=gain)
+            except ValueError:
+                pass
+                #print(mod)

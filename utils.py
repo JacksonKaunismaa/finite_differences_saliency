@@ -9,6 +9,17 @@ def remove_borders(ax, borders=None):
     for border in borders:
         ax.spines[border].set_visible(False)
 
+def plot_color_classes(dataset, y_scale, labels=False, alpha=0.25):
+    color_probe = np.linspace(0, 255, 255)
+    color_class = np.asarray([dataset.color_classifier(x) for x in color_probe])
+    color_class = color_class/(dataset.num_classes-1)*(y_scale[1]-y_scale[0]) + y_scale[0]
+
+    plt.plot(color_probe, color_class, c="k", alpha=alpha)
+    if labels:
+        plt.xlabel("Color")
+        plt.yticks([0, 1, 2])
+        plt.ylabel("Class")
+
 
 def find_good_ratio(size): # find ratio as close to a square as possible
     start_width = int(np.sqrt(size))
@@ -19,8 +30,7 @@ def find_good_ratio(size): # find ratio as close to a square as possible
     return min(height, width), max(height, width)  # height, width
 
 
-def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None,
-        channel_mode=None):
+def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None, channel_mode=None):
     #np_grid = np.array(grid).squeeze()
     #if len(np_grid.shape) != 4:
     #    np_grid = np.expand_dims(np_grid, 0)
@@ -74,6 +84,9 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
         for j, unsqueezed_img in enumerate(row):
             img = unsqueezed_img.squeeze()
             idx = (j,i) if transpose and not channel_mode == "split" else (i,j)  # split_channels already accounts for transpose
+            axes[idx].set_xticks([])
+            axes[idx].set_yticks([])
+            remove_borders(axes[idx])
             if idx[1] == 0: # assume explain_img is the first thing
                 if len(img.shape) == 3 and img.shape[2] == 3:
                     im = axes[idx].imshow(img)
@@ -96,7 +109,7 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
                     plt.colorbar(im, pad=0, fraction=0.048)
             if titles and idx[0] == 0:
                 axes[idx].set_title(titles[idx[1]])
-    plt.show()
+    #plt.show()
 
 
 def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True, num_lines=0, line_width=0, ax=None, rm_border=False):
@@ -104,7 +117,10 @@ def imshow_centered_colorbar(img, cmap="bwr", title=None, colorbar=True, num_lin
         ax = plt.gca()
     heat_max = np.max(abs(img))
     img_width, img_height = img.shape[1], img.shape[0]
-    im = ax.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max, extent=(0,img_width,0,img_height))
+    if cmap == "gray":
+        im = ax.imshow(img, cmap=cmap, extent=(0,img_width,0,img_height))
+    else:
+        im = ax.imshow(img, cmap=cmap, vmin=-heat_max, vmax=heat_max, extent=(0,img_width,0,img_height))
 
     ax.set_xticks([])
     ax.set_yticks([])

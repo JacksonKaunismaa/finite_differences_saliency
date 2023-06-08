@@ -4,16 +4,17 @@ from sklearn import decomposition
 from scipy.interpolate import RegularGridInterpolator
 import torch
 from tqdm import tqdm
-from network import correct  # for rate_distribution (reads it as a global variable)
 from hooks import AllActivations
 import utils
+import training
 import matplotlib.pyplot as plt
 import warnings
 from collections import defaultdict
 from scipy.optimize import minimize
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.colors import LightSource
-from mayavi import mlab  # only works when running locally
+import time
+#from mayavi import mlab  # only works when running locally
 # PCA Stuff
 
 
@@ -23,7 +24,7 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
     for _ in range(sample_size):
         sample.append(dataset.generate_one()[0])
     sample = np.array(sample).squeeze().astype(np.float32)
-    im_size = dataset.size
+    im_size = dataset.cfg.size
 
     if isinstance(strides, int):
         strides = [strides]*len(scales)
@@ -35,7 +36,7 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
 
         xs = np.mgrid[scale:im_size:stride]  # technically wrong (but its shape is correct)
         num_grid = xs.shape[0]
-        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, dataset.channels))
+        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, dataset.cfg.channels))
 
         pca_fitter = decomposition.PCA(n_components=num_components, copy=False)
         scale_fitter = StandardScaler()
@@ -48,7 +49,7 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
                     warnings.simplefilter("ignore")  # gives pointless zero-division warnings
                     pca_fitter.fit(normalized)
                 for comp in range(num_components):
-                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, dataset.channels)
+                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, dataset.cfg.channels)
 
         pca_direction_grids.append(pca_direction_grid.copy())
     return pca_direction_grids
@@ -56,10 +57,10 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
 def old_old_pca_direction_grids(model, dataset, target_class, img,
                         sample_size=512, scales=[3,5,9,15],
                         strides=None, pca_direction_grids=None,
-                       gaussian=False, device=None):
+                       gaussian=False):
     # begin by computing pca directions and d_output_d_alphas
     model.eval()
-    im_size = dataset.size
+    im_size = dataset.cfg.size
     if strides is None:
         strides = scales
     if pca_direction_grids is None:
@@ -83,9 +84,9 @@ def old_old_pca_direction_grids(model, dataset, target_class, img,
                 indices = strided_indices[:, i, j, ...]  # will have to slice these
 
                 # do d_output_d_alpha computation
-                alpha = torch.tensor(0.0, requires_grad=True).to(device)
-                direction_tensor = torch.tensor(pca_direction).to(device).float().unsqueeze(0)
-                img_tensor = torch.tensor(img.transpose(2,0,1)).to(device).float().unsqueeze(0)
+                alpha = torch.tensor(0.0, requires_grad=True).to(dataset.cfg.device)
+                direction_tensor = torch.tensor(pca_direction).to(dataset.cfg.device).float().unsqueeze(0)
+                img_tensor = torch.tensor(img.transpose(2,0,1)).to(dataset.cfg.device).float().unsqueeze(0)
                 img_tensor[..., indices[0,0,0]:indices[0,-1,-1]+1, indices[1,0,0]:indices[1,-1,-1]+1] += alpha*direction_tensor
                 output = model(img_tensor)[0,target_class]
                 d_out_d_alpha = torch.autograd.grad(output, alpha)[0]
@@ -114,10 +115,10 @@ def old_old_pca_direction_grids(model, dataset, target_class, img,
     return saliency_map
 
 def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction_grids,
-                        strides=None, gaussian=False, device=None, component=0, batch_size=32):
+                        strides=None, gaussian=False, component=0, batch_size=32):
     # begin by computing d_output_d_alphas
     model.eval()
-    im_size = dataset.size
+    im_size = dataset.cfg.size
     if strides is None:
         strides = scales
     if isinstance(strides, int):
@@ -129,7 +130,7 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
 
     stacked_img = np.repeat(np.expand_dims(img, 0), batch_size, axis=0)
     stacked_img = np.transpose(stacked_img, (0, 3, 1, 2)).astype(np.float32) # NCHW format
-    img_tensor = dataset.implicit_normalization(torch.tensor(stacked_img).to(device))
+    img_tensor = dataset.implicit_normalization(torch.tensor(stacked_img).to(dataset.cfg.device))
 
     for s, (scale, stride) in enumerate(zip(scales, strides)):
         # centers are [scale//2, ..., im_size-scale//2-1], num_windows = im_size-scale+1
@@ -154,8 +155,8 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
             batch_window_indices = index_windows[:, batch_locs[:,0], batch_locs[:,1], ...]
 
             # do d_output_d_alpha computation
-            alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(device)
-            direction_tensor = dataset.implicit_normalization(torch.tensor(pca_directions).to(device).float())
+            alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(dataset.cfg.device)
+            direction_tensor = dataset.implicit_normalization(torch.tensor(pca_directions).to(dataset.cfg.device).float())
             img_tensor[np.arange(actual_batch_size)[:,None,None], :, batch_window_indices[0], batch_window_indices[1]] += alpha*direction_tensor
             output = model(img_tensor)  # sum since gradient will be back-proped as vector of 1`s
 
@@ -213,7 +214,7 @@ def visualize_pca_directions(pca_direction_grid_scales, title, scales, lines=Tru
 
 
 def generate_many_pca(net, seeds, pca_directions_1_stride, scales, dataset, component=0, batch_size=128,
-                      strides=None, skip_1_stride=False, device=None):
+                      strides=None, skip_1_stride=False):
     _pca_map_s_strides = []
     _pca_map_1_strides = []
     _grad_maps = []
@@ -221,17 +222,17 @@ def generate_many_pca(net, seeds, pca_directions_1_stride, scales, dataset, comp
     if strides is None:
         strides = scales
     for seed in seeds:
-        np.random.seed(seed)
+        dataset.rng.seed(seed)
         generated_img, label, *__ = dataset.generate_one()
-        tensored_img = utils.tensorize(generated_img, device=device, requires_grad=True)
+        tensored_img = utils.tensorize(generated_img, device=dataset.cfg.device, requires_grad=True)
         grad_map = torch.autograd.grad(net(tensored_img)[0,label.argmax()], tensored_img)[0]
         pca_map_strided = pca_direction_grids(net, dataset, label.argmax(), generated_img,
                                               scales, pca_directions_1_stride, strides=strides,
-                                              device=device, batch_size=batch_size, component=component)
+                                              batch_size=batch_size, component=component)
         if not skip_1_stride:
             pca_map_1_stride = pca_direction_grids(net, dataset, label.argmax(), generated_img,
                                                    scales, pca_directions_1_stride, component=component,
-                                                   device=device, batch_size=batch_size, strides=1)
+                                                   batch_size=batch_size, strides=1)
         _explain_imgs.append(generated_img)
         _grad_maps.append(grad_map.detach().cpu().squeeze(0).numpy().transpose(1,2,0))
         _pca_map_s_strides.append(pca_map_strided.copy())
@@ -267,7 +268,7 @@ def finite_differences(model, dataset, target_class, stacked_img, locations, cha
 
         actual_diffs = shift_img[slices] - stacked_img[slices]
         img_norm = dataset.implicit_normalization(torch.tensor(shift_img).to(device)) # best is no normalization anyway
-        if dataset.num_classes == 2:
+        if dataset.cfg.num_classes == 2:
             activations = dataset.class_multiplier(target_class)*model(img_norm, logits=True)
         else:
             activations = model(img_norm)[:, target_class]
@@ -276,11 +277,11 @@ def finite_differences(model, dataset, target_class, stacked_img, locations, cha
         largest_slope = np.where(abs(finite_difference) > abs(largest_slope), finite_difference, largest_slope)
     return largest_slope
 
-def finite_differences_map(model, dataset, target_class, img, device=None, unfairness="fair", values_prior=None,
+def finite_differences_map(model, dataset, target_class, img, unfairness="fair", values_prior=None,
                            batch_size=32, num_values=20):
     # generate a saliency map using finite differences method (iterate over colors)
     model.eval()
-    im_size = dataset.size
+    im_size = dataset.cfg.size
     #img = img.astype(np.float32)/255. # normalization handled later
     indices = np.mgrid[:im_size, :im_size].transpose(1,2,0).reshape(im_size*im_size, -1)
     stacked_img = np.repeat(np.expand_dims(img, 0), batch_size, axis=0)
@@ -288,19 +289,19 @@ def finite_differences_map(model, dataset, target_class, img, device=None, unfai
     img_heat_map = np.zeros_like(img).astype(np.float32)
 
     with torch.no_grad():
-        cuda_stacked_img = dataset.implicit_normalization(torch.tensor(stacked_img).to(device))
-        if dataset.num_classes == 2:
+        cuda_stacked_img = dataset.implicit_normalization(torch.tensor(stacked_img).to(dataset.cfg.device))
+        if dataset.cfg.num_classes == 2:
             baseline_activations = dataset.class_multiplier(target_class)*model(cuda_stacked_img, logits=True)
         else:
             baseline_activations = model(cuda_stacked_img)[:, target_class]
         del cuda_stacked_img
 
-    for channel in range(dataset.channels):
+    for channel in range(dataset.cfg.channels):
         for k in tqdm(range(0, im_size*im_size, batch_size)):
             actual_batch_size = min(batch_size, im_size*im_size-k)
             locations = indices[k:k+actual_batch_size]
             largest_slopes = finite_differences(model, dataset, target_class, stacked_img[:actual_batch_size],
-                                                locations, channel, unfairness, values_prior, num_values, device,
+                                                locations, channel, unfairness, values_prior, num_values,
                                                 baseline_activations[:actual_batch_size])
             img_heat_map[locations[:,0], locations[:,1], channel] = largest_slopes
     return img_heat_map#.sum(axis=2)  # linear approximation aggregation?
@@ -310,19 +311,19 @@ def finite_differences_map(model, dataset, target_class, img, device=None, unfai
 
 
 @torch.no_grad()
-def rate_distribution(net, loader, dataset, device=None, buckets=100, critical_values=[]):
+def rate_distribution(net, dataset, buckets=100, critical_values=[]):
     # Plot model error rates as function of color (for greyscale dataset)
     net.eval()
     total = np.zeros((buckets))
     num_correct = np.zeros((buckets))
-    num_possible_colors = dataset.color_range[1] - dataset.color_range[0]
-    for sample in tqdm(loader):
-        imgs = sample["image"].to(device).float()
-        labels = sample["label"].to(device).float()
+    num_possible_colors = dataset.cfg.color_range[1] - dataset.cfg.color_range[0]
+    for sample in tqdm(dataset.dataloader()):
+        imgs = sample["image"].to(dataset.cfg.device).float()
+        labels = sample["label"].to(dataset.cfg.device).float()
         actual_colors = sample["color"]
-        color_indices = (buckets * (actual_colors - dataset.color_range[0]) / num_possible_colors).int().numpy()
+        color_indices = (buckets * (actual_colors - dataset.cfg.color_range[0]) / num_possible_colors).int().numpy()
         outputs = net(imgs)
-        correct_preds = correct(outputs, labels).cpu().numpy()
+        correct_preds = training.correct(outputs, labels).cpu().numpy()
         for i, color_idx in enumerate(color_indices):
             total[color_idx] += 1
             num_correct[color_idx] += correct_preds[i]
@@ -330,7 +331,7 @@ def rate_distribution(net, loader, dataset, device=None, buckets=100, critical_v
     # Plot results of rate_distribution
     num_wrong = total - num_correct
     width = 0.4
-    labels = [int(x) for i, x in enumerate(np.linspace(*dataset.color_range, buckets))]
+    labels = [int(x) for i, x in enumerate(np.linspace(*dataset.cfg.color_range, buckets))]
     plt.bar(labels, num_correct, width, label="correct amount")
     plt.bar(labels, num_wrong, width, bottom=num_correct, label="wrong amount")
     plt.vlines(critical_values, 0, np.max(total), linewidth=0.8,
@@ -342,19 +343,49 @@ def rate_distribution(net, loader, dataset, device=None, buckets=100, critical_v
 
 
 @torch.no_grad()
-def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=None):
+def response_graph(net, dataset, test_index=987_652, title=None, selection=None, img=None, class_select=None, use_arcsinh=True, no_plot=False, batch_size=64):
     # Plot network output logits as color varies for a specific image
-    net.eval() # very important!
+    # class_select can be specified as a bool, indicating you want to take lbl.argmax() each time (and that you aren't passing in an img with selection)
+    # or it can be an integer, indicating you want to look at that specific logit each time (and you have passed in the same img, with selection)
+    net.eval()
     counterfactual_color_values = np.linspace(0, 255, 255)
     responses = []
-    for color in counterfactual_color_values:
-        np.random.seed(test_index)
-        generated_img, lbl, *__ = dataset.generate_one(set_color=color)
-        generated_img = utils.tensorize(generated_img, device)
-        response = net(generated_img, logits=True).cpu().numpy()
-        responses.append(np.squeeze(response))
+    actual_selection = 0
+    if img is not None:
+        img = img.repeat(batch_size,1,1,1)
+        actual_selection = len(selection)
+        #print(actual_selection)
+    else:
+        batch_size = 1
+    num_changed = 0  # what pct of the time do the changes to the pixels change the actual classification
+    for color_idx in range(0, len(counterfactual_color_values), batch_size):
+        actual_batch_size = min(batch_size, len(counterfactual_color_values)-color_idx)
+        color_slice = slice(color_idx, color_idx+actual_batch_size)
+        color = counterfactual_color_values[color_slice]
+
+        if selection is None:
+            dataset.rng.seed(test_index)
+            generated_img, lbl, *__ = dataset.generate_one(set_color=color[0])
+            img = utils.tensorize(generated_img, dataset.cfg.device)
+        else:
+            img[:actual_batch_size, 0, selection[:,0], selection[:,1]] = torch.tensor(color).to(dataset.cfg.device).float().unsqueeze(1)
+            #plt.imshow(img[50].detach().cpu().numpy().squeeze(), cmap="gray")
+        response = net(img, logits=True).cpu().numpy().squeeze()
+        if class_select is not None:
+            for elem,clr in zip(response, color):
+                if dataset.color_classifier(clr) == elem.argmax():
+                    num_changed += 1
+                if isinstance(class_select, bool):
+                    responses.append(np.expand_dims(elem[lbl.argmax()], 0))
+                else:
+                    responses.append(np.expand_dims(elem[class_select], 0))
+        else:
+            responses.append(response)
 
     responses = np.asarray(responses)
+    if no_plot:
+        return num_changed, actual_selection, responses
+
     if use_arcsinh:
         responses = np.arcsinh(responses)
 
@@ -364,9 +395,13 @@ def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=No
     plt.legend()
     plt.xlabel("Color value")
     plt.ylabel("Network output logit")
-    plt.vlines([100, 150], np.min(responses), np.max(responses), linewidth=0.8,
-               colors="r", label="decision boundary",
-               linestyles="dashed") # with .eval() works well
+    #plt.vlines([100, 150], np.min(responses), np.max(responses), linewidth=0.8,
+    #           colors="r", label="decision boundary",
+    #           linestyles="dashed") # with .eval() works well
+    utils.plot_color_classes(dataset, (np.min(responses), np.max(responses)), alpha=1.0)
+    if title is not None:
+        plt.title(title)
+    return num_changed, actual_selection, responses
 
 
 
@@ -376,10 +411,14 @@ def response_graph(net, dataset, test_index=987_652, use_arcsinh=True, device=No
 
 def compute_profile_plot(profile, dataset):
     avg_line = []
+    stds = []
     start = 0
     for c in range(255):
         if np.any(profile[:,0]==c):
-            avg_line.append(profile[:,1][profile[:,0]==c].mean())
+            selection = profile[:,1][profile[:,0]==c]
+            avg_line.append(selection.mean())
+            stds.append(selection.std())
+
         else:
             if avg_line:
                 avg_line.append(avg_line[-1]) # assume previous value continues
@@ -388,22 +427,22 @@ def compute_profile_plot(profile, dataset):
     avg_line = np.asarray(avg_line)
 
     color_values = np.arange(start, 255)
-    classes = np.vectorize(dataset.color_classifier)(color_values)/(dataset.num_classes-1)
-    return avg_line, color_values, classes, profile
+    classes = np.vectorize(dataset.color_classifier)(color_values)/(dataset.cfg.num_classes-1)
+    return avg_line, color_values, classes, profile, stds
 
 
 def get_profile_y_lims(profile_plot):
-    avg_line, color_values, classes, profile = profile_plot
+    avg_line, color_values, classes, profile, stds = profile_plot
     max_y = min(max(avg_line)*1.3, max(profile[:,1]))
     min_y = max(min(avg_line)*(1-0.3*np.sign(min(avg_line))), min(profile[:,1]))
     return min_y, max_y
 
 
-def show_profile_plot(profile_plot, hide_ticks=False, ax=None, rm_border=False, y_lims=None):
+def show_profile_plot(profile_plot, hide_ticks=False, hide_y_ticks=False, ax=None, rm_border=False, y_lims=None, bands=True):
     if ax is None:
         ax = plt.gca()
 
-    avg_line, color_values, classes, profile = profile_plot
+    avg_line, color_values, classes, profile, stds = profile_plot
 
     if y_lims is None:
         min_y, max_y = get_profile_y_lims(profile_plot)
@@ -411,21 +450,52 @@ def show_profile_plot(profile_plot, hide_ticks=False, ax=None, rm_border=False, 
         min_y, max_y = y_lims
     scaled_classes = classes*(max_y-min_y) + min_y
 
-    ax.scatter(profile[:,0], profile[:,1], s=0.5, marker="o", alpha=0.08)
+    if bands:
+        colors = {class_value: clr for class_value,clr in zip(sorted(list(set(classes))), ["g", "m", "y"])}
+        class_names = {class_value: f"Class {name}" for class_value,name in zip(sorted(list(set(classes))), range(500))}
+        seen_colors = set()
+        start_x = 0
+        curr_value = classes[0]
+        for pos_now, class_val in enumerate(classes):
+            if class_val != curr_value:
+                lbl = None
+                if curr_value not in seen_colors:
+                    lbl = class_names[curr_value]
+                    seen_colors.add(curr_value)
+                ax.fill_betweenx((min_y, max_y), start_x, pos_now, color=colors[curr_value], alpha=0.2, label=lbl)
+                curr_value = class_val
+                start_x = pos_now
+        ax.fill_betweenx((min_y, max_y), start_x, pos_now+10, color=colors[curr_value], alpha=0.2)
+        plt.legend()
+
+    else:
+        ax.plot(color_values, scaled_classes, alpha=0.6, c="c")
+    ax.scatter(profile[:,0], profile[:,1], s=0.5, marker="o", alpha=0.08, c="m")
+    #ax.fill_between(color_values, avg_line-stds, avg_line+stds, color="k", alpha=0.5)
     ax.plot(color_values, avg_line, c="r")
-    ax.plot(color_values, scaled_classes, c="k", alpha=0.25)
 
     ax.set_ylim(min_y-(max_y-min_y)*0.01, max_y+(max_y-min_y)*0.01)
     if hide_ticks:
         ax.set_xticks([])
+    if hide_y_ticks:
+        ax.set_yticks([])
+        
     if rm_border:
-        utils.remove_borders(ax, ["top", "bottom", "right"])#, "left"])
+        if hide_y_ticks:
+            utils.remove_borders(ax, ["top", "bottom", "right", "left"])
+        else:
+            utils.remove_borders(ax, ["top", "bottom", "right"])#, "left"])
+        
 
 
 def show_profile_plots(color_profile, names, hide_ticks=True, rm_border=True, fixed_height=False, size_mul=1.):
+    if isinstance(names, str):  # ie. expand names based on root name
+        names = [k for k in color_profile if names in k]
+
     shape = utils.find_good_ratio(len(names))
     if not isinstance(size_mul, tuple):
         size_mul = (size_mul, size_mul)
+
 
     figsize = shape[1]*6*size_mul[1], shape[0]*6*size_mul[0]
 
@@ -451,18 +521,22 @@ def show_profile_plots(color_profile, names, hide_ticks=True, rm_border=True, fi
 
     for h in range(shape[0]):
         for w in range(shape[1]):
+            if w == 0:
+                axes[h,w].set_ylabel("Average channel activation")
+            if h == shape[0]-1 and w==shape[1]//2:
+                axes[h,w].set_xlabel("Image Intensity")
             name = w+h*shape[1]
-            show_profile_plot(color_profile[names[name]],
+            show_profile_plot(color_profile[names[name]], hide_y_ticks=(w!=0 and rm_border), bands=True,
                               hide_ticks=hide_ticks, ax=axes[h,w], rm_border=rm_border, y_lims=y_lims)
 
 
 @torch.no_grad()
-def activation_color_profile(net, loader, dataset, device=None):
+def activation_color_profile(net, dataset):
     # assume it already has AllActivations hooks on it
     net.eval()
     filter_activations = defaultdict(list) # conv filter: [(color, sum_activations), ...]
-    for sample in tqdm(loader):
-        imgs = sample["image"].to(device).float()
+    for sample in tqdm(dataset.dataloader()):
+        imgs = sample["image"].to(dataset.cfg.device).float()
         #labels = sample["label"].to(device).float()
         colors = sample["color"]
         net(imgs)
@@ -472,8 +546,8 @@ def activation_color_profile(net, loader, dataset, device=None):
                 # ignore batchnorms, and pre-activation func
                 if "act_func" in layer_name: # happens to be identical implementation for fully_connected
                     for channel in range(activation.shape[1]):
-                        entry = color.item(), activation[i][channel].sum().item() # could do group conv to give data on input channels?
-                        filter_activations[f"{layer_name}_{channel}"].append(entry)
+                        entry = color.item(), activation[i][channel].mean().item() # could do group conv to give data on input channels?
+                        filter_activations[f"{layer_name}_{channel}"].append(entry)  # should be mean so that activation doesn't scale with map size
                 else:
                     break
     filter_activations = {k:np.asarray(v) for k,v in filter_activations.items()}
@@ -495,7 +569,7 @@ def show_conv_layer(net, layer_name, shape=None):
                                    line_width=map_size, colorbar=False, rm_border=True)
 
 
-def get_weight(net, weight_name):
+def get_weight(net, weight_name, merge_batchnorms=False):
     if "conv_block" in weight_name:
         infer_weight_name = weight_name.replace("act_func", "conv") # infer desired weights
     else:
@@ -508,27 +582,38 @@ def get_weight(net, weight_name):
         curr_module = net
 
     for attr in attrs:
+        parent_mod = curr_module
         try:
             curr_module = curr_module[int(attr)]
         except ValueError:
             curr_module = getattr(curr_module, attr)
+    if merge_batchnorms:  # combine the convolution with the scaling effect of the batchnorm (still ignores biases)
+        bn = getattr(parent_mod, attr.replace("conv", "batch_norm"))
+        #print("parent", parent_mod, "parent")
+        #print(bn)
+        scale_factor = bn.weight / torch.sqrt(bn.running_var)
+        #print(scale_factor.shape)
+        return (curr_module.weight * scale_factor[:, None, None, None]).detach().cpu().numpy()
     return curr_module.weight.detach().cpu().numpy()
 
 def show_fully_connected(net, weight_name):
     pass
 
-def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, size_mul=6, rm_border=True, fixed_height=False):
+def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, size_mul=6, rm_border=True, fixed_height=False, full_gridspec=False, merge_batchnorms=True):
     # assume net it already has AllActivations hooks on it
     # implicitly assume that channel-aligned view is salient for the given network
-    weights = get_weight(net, weight_name)   # N_out, N_in, K, K
+    weights = get_weight(net, weight_name, merge_batchnorms=merge_batchnorms)   # N_out, N_in, K, K
     if outer_shape is None:
         outer_shape = utils.find_good_ratio(weights.shape[0])
     inner_shape = utils.find_good_ratio(weights.shape[1])
     map_size = weights.shape[-1]
     def reshaper(w):
         grid_w = w.reshape(*inner_shape, map_size, map_size)
+        if full_gridspec:
+            return grid_w
+        #print("gw", grid_w.shape)
         return np.concatenate(np.concatenate(grid_w, 1), 1)
-    show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul, rm_border, fixed_height)
+    show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul, rm_border, fixed_height, full_gridspec=full_gridspec)
 
 
 def show_fc_conv(net, weight_name="fully_connected.0.act_func", size_mul=1, color_profile=None, rm_border=True,
@@ -567,7 +652,7 @@ def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_s
         size_mul = (size_mul, size_mul)
 
 
-    figsize = map_size*outer_shape[1]*inner_shape[1]/8*size_mul[1], map_size*outer_shape[0]*inner_shape[0]/8*size_mul[0]
+    figsize = map_size*outer_shape[1]*inner_shape[1]/8*size_mul[1], map_size*outer_shape[0]*inner_shape[0]/10*size_mul[0]
     if color_profile:
         figsize = figsize[0], figsize[1]*2
     fig = plt.figure(figsize=figsize)#, constrained_layout=True)
@@ -601,73 +686,79 @@ def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_s
             if full_gridspec:
                 sub_gs = gs[gs_idx].subgridspec(*inner_shape)
                 sub_axes = sub_gs.subplots()
+                if len(sub_axes.shape) == 1:
+                    sub_axes = np.expand_dims(sub_axes, 0)
                 for i in range(inner_shape[0]):
                     for j in range(inner_shape[1]):
+                        #print(weights.shape, weights[channel].shape, "reshaper(w[c])")
                         utils.imshow_centered_colorbar(reshaper(weights[channel])[i,j], colorbar=False,
-                                                       ax=sub_axes[i,j], rm_border=rm_border)
+                                                    ax=sub_axes[i,j], rm_border=False)
                 axes[gs_idx].set_xticks([])
                 axes[gs_idx].set_yticks([])
                 if rm_border:
                     utils.remove_borders(axes[gs_idx])
             else:
                 utils.imshow_centered_colorbar(reshaper(weights[channel]), line_width=map_size if map_size > 1 else 0,
-                                        colorbar=False, ax=axes[gs_idx], rm_border=rm_border)
+                                        colorbar=True, ax=axes[gs_idx], rm_border=rm_border)
             if color_profile:
-                gs_idx = h*2+1, w
+                gs_idx = (h*2+1,w) 
+                if w == 0:
+                    axes[gs_idx].set_ylabel("Response")
+                axes[gs_idx].set_xlabel("Image Intensity")
                 show_profile_plot(color_profile[f"{weight_name}_{selection[channel]}"],
                                   hide_ticks=True, ax=axes[gs_idx], rm_border=True, y_lims=y_lims)
 
 
-# only works when running locally
-def mlab_fc_conv_feature_angles(net, layer_name, num_embed=3, normalize=True):
-    # get conv->fc weight/feature angles
-    weights = get_weight(net, layer_name)  # (In, Out)
-    shape = net.final_img_shape
-    shaped_w = weights.reshape(-1, shape[2], shape[0]*shape[1])  # C_out, C_in, HW
-    mags = np.linalg.norm(shaped_w, axis=-1)[..., np.newaxis]  # 3, 6, 64
-    norm_w = shaped_w/mags if normalize else shaped_w
-    dots = np.einsum("kji,lji->jkl", norm_w, norm_w)
-
-    if num_embed not in [2,3]:
-        return dots
-
-    def gram_diff(w, desired_grams):
-        w_mat = w.reshape(*embed_shape)
-        grams = w_mat.dot(w_mat.T)
-        return ((grams - desired_grams)**2).sum()
-    embed_shape = (norm_w.shape[0], num_embed)
-    embedded_weights = np.zeros((norm_w.shape[1], *embed_shape))
-    closeness = np.zeros(norm_w.shape[1])
-    for i, feats in enumerate(norm_w.transpose(1,0,2)): # 3, 64
-        projection = minimize(gram_diff, np.ones(num_embed*embed_shape[0]),
-                              args=(dots[i],))
-        embedded_weights[i] = projection.x.reshape(*embed_shape)
-        closeness[i] = projection.fun
-
-    #grid_shape = utils.find_good_ratio(norm_w.shape[1])
+# only works when running locally (and should probably just do it manually instead with like surfaces and a bunch of math)
+#def mlab_fc_conv_feature_angles(net, layer_name, num_embed=3, normalize=True):
+#    # get conv->fc weight/feature angles
+#    weights = get_weight(net, layer_name)  # (In, Out)
+#    shape = net.final_img_shape
+#    shaped_w = weights.reshape(-1, shape[2], shape[0]*shape[1])  # C_out, C_in, HW
+#    mags = np.linalg.norm(shaped_w, axis=-1)[..., np.newaxis]  # 3, 6, 64
+#    norm_w = shaped_w/mags if normalize else shaped_w
+#    dots = np.einsum("kji,lji->jkl", norm_w, norm_w)
+#
+#    if num_embed not in [2,3]:
+#        return dots
+#
+#    def gram_diff(w, desired_grams):
+#        w_mat = w.reshape(*embed_shape)
+#        grams = w_mat.dot(w_mat.T)
+#        return ((grams - desired_grams)**2).sum()
+#    embed_shape = (norm_w.shape[0], num_embed)
+#    embedded_weights = np.zeros((norm_w.shape[1], *embed_shape))
+#    closeness = np.zeros(norm_w.shape[1])
+#    for i, feats in enumerate(norm_w.transpose(1,0,2)): # 3, 64
+#        projection = minimize(gram_diff, np.ones(num_embed*embed_shape[0]),
+#                              args=(dots[i],))
+#        embedded_weights[i] = projection.x.reshape(*embed_shape)
+#        closeness[i] = projection.fun
+#
+#    #grid_shape = utils.find_good_ratio(norm_w.shape[1])
 #    colors = ["coral", "forestgreen", "royalblue"]
 #    labels = ["class "+x for x in "012"]
-    origin = np.zeros(embed_shape[0])
-    for w in embedded_weights:
-        #lims = np.max(abs(w))
-        if num_embed == 3:
-            print(w.shape, origin.shape)
-            obj = mlab.quiver3d(origin, origin, origin, w[:,0], w[:,1], w[:,2])#, color=colors[k])#, label=labels[k])
-            obj.actor.property.interpolation = "phong"
-            obj.actor.property.specular = 0.1
-            obj.actor.property.specular_power = 5
-            return obj
-        #else:
-        #    ax = fig.add_subplot(gs[i,j])
-        #    for k in range(embed_shape[0]):
-        #        ax.quiver(0, 0, w[k,0], w[k,1], scale=2.0, color=colors[k], label=labels[k])
-        #ax.set_xticklabels([])
-        #ax.set_yticklabels([])
-        #ax.set_title(f"{int(closeness[feature]*1000.)}")
-        #ax.set_xlim(-lims, lims)
-        #ax.set_ylim(-lims, lims)
-    #fig.legend(*ax.get_legend_handles_labels())
-    return dots, embedded_weights
+#    origin = np.zeros(embed_shape[0])
+#    for w in embedded_weights:
+#        #lims = np.max(abs(w))
+#        if num_embed == 3:
+#            print(w.shape, origin.shape)
+#            obj = mlab.quiver3d(origin, origin, origin, w[:,0], w[:,1], w[:,2])#, color=colors[k])#, label=labels[k])
+#            obj.actor.property.interpolation = "phong"
+#            obj.actor.property.specular = 0.1
+#            obj.actor.property.specular_power = 5
+#            return obj
+#        #else:
+#        #    ax = fig.add_subplot(gs[i,j])
+#        #    for k in range(embed_shape[0]):
+#        #        ax.quiver(0, 0, w[k,0], w[k,1], scale=2.0, color=colors[k], label=labels[k])
+#        #ax.set_xticklabels([])
+#        #ax.set_yticklabels([])
+#        #ax.set_title(f"{int(closeness[feature]*1000.)}")
+#        #ax.set_xlim(-lims, lims)
+#        #ax.set_ylim(-lims, lims)
+#    #fig.legend(*ax.get_legend_handles_labels())
+#    return dots, embedded_weights
 
 
 def fc_conv_feature_angles(net, layer_name, num_embed=3, normalize=True):
@@ -738,6 +829,148 @@ def display_fc_conv_grams(dots, selection=None, fig_mul=1.0):
             feature = i*shape[1]+j
             utils.imshow_centered_colorbar(dots[feature], cmap="bwr", colorbar=False, rm_border=False, ax=axes[i,j])
 
+
+
+# Region Importance
+
+
+
+@torch.no_grad()
+def random_pixels_response(net, dataset, num_pixels, img_id=987_652, one_class=True, no_plot=False, batch_size=128):
+    net.eval() # very important!
+    dataset.rng.seed(img_id)
+    generated_img, lbl, color, size, pos  = dataset.generate_one()
+    tensor_img = utils.tensorize(generated_img, device=dataset.cfg.device)
+
+    im_size = dataset.cfg.size
+    possible_pixels = np.mgrid[:im_size, :im_size].transpose(1,2,0).reshape(im_size*im_size, -1)
+    selected_pixels = possible_pixels[np.random.choice(len(possible_pixels), num_pixels, replace=False)]
+    num_inside = 0
+    for p in selected_pixels:
+        if np.linalg.norm(p-pos) < size:
+            num_inside += 1
+    if not no_plot:
+        print(f"Percent of random inside circle: {num_inside/num_pixels*100.}")
+    class_select = lbl.argmax() if one_class else None
+    return response_graph(net, dataset, title="Randomly selected pixels",
+                   selection=selected_pixels, img=tensor_img, class_select=class_select, use_arcsinh=False, no_plot=no_plot, batch_size=batch_size)
+
+
+@torch.no_grad()
+def circle_pixels_response(net, dataset, num_pixels, width, img_id=987_652, outer=True, one_class=True, no_plot=False, batch_size=128):
+    # random selected pixels must be inside circle, but within "width" of the edge if outer==True
+    # but greater than "width" from the edge if outer==False
+    net.eval() # very important!
+    dataset.rng.seed(img_id)  # generate image
+    generated_img, lbl, color, size, pos = dataset.generate_one()
+    tensor_img = utils.tensorize(generated_img, device=dataset.cfg.device)
+
+    size = size[0]
+    num_angles = 500
+    num_radii = 50
+    angle = np.linspace(0, 2*np.pi, num_angles)
+    if width is None:
+        radii = np.linspace(0, size, num_radii)
+    elif outer:
+        radii = np.linspace(size-width, size, num_radii)
+        circle_area = size**2
+        area_pct = (circle_area - (size-width)**2) / circle_area
+        if not no_plot:
+            print(f"Only using points within {width} pixels of the outer edge ({area_pct*100.:.2f}% of circle area)")
+    else:
+        circle_area = size**2
+        area_pct = (size-width)**2 / circle_area
+        if not no_plot:
+            print(f"Only using points further than {width} pixels from the outer edge ({area_pct*100.:.2f}% of circle area)")
+        radii = np.linspace(0, size-width, num_radii)
+    possible_indices = np.zeros((num_radii*num_angles, 2))
+    possible_indices[:,0] = (pos[0][0] + np.cos(angle)*radii[:,None]).flat
+    possible_indices[:,1] = (pos[0][1] + np.sin(angle)*radii[:,None]).flat
+    possible_indices = np.round(possible_indices).astype(np.int64)  # all possible pixels we can select (cant do np.unique because slow
+    im_size = dataset.cfg.size
+    zero_img = np.zeros((im_size, im_size))
+    #print(possible_indices.shape)
+    zero_img[possible_indices[:,0], possible_indices[:,1]] = 1
+    possible_pixels = np.nonzero(zero_img)
+    #print(len(possible_pixels[0]), len(possible_pixels[1]))
+    #print(len(possible_pixels[0]))
+    selected_indices = np.random.choice(len(possible_pixels[0]), min(num_pixels, len(possible_pixels[0])), replace=False)
+    selected_pixels = np.zeros((len(selected_indices), 2))
+    selected_pixels[:,0] = possible_pixels[0][selected_indices]
+    selected_pixels[:,1] = possible_pixels[1][selected_indices]
+    #print(selected_pixels.shape)
+
+    class_select = lbl.argmax() if one_class else None
+    return response_graph(net, dataset, title="Pixels inside circle",
+                   selection=selected_pixels, img=tensor_img, class_select=class_select, use_arcsinh=False, no_plot=no_plot, batch_size=batch_size)
+
+
+def both_pixels_response(net, dataset, num_pixels, width, one_class, img_id=987_652, outer=True, no_plot=False, batch_size=128):
+    if not no_plot:
+        plt.figure(figsize=(10,4))
+        plt.subplot(1,2,1)
+    res1 = circle_pixels_response(net, dataset, num_pixels, width, one_class=one_class, img_id=img_id, outer=outer, no_plot=no_plot, batch_size=batch_size)
+    if not no_plot:
+        plt.subplot(1,2,2)
+    res2 = random_pixels_response(net, dataset, num_pixels, img_id=img_id, one_class=one_class, no_plot=no_plot, batch_size=batch_size)
+    return res1, res2
+
+
+def region_importance_exp(net, dataset, num_pixels, width, batch_size=128, runs=1000, verbose=False):
+    changed_rand = changed_inner = changed_outer = 0  # num times that the pixels selected actually altered the class prediction
+    total_rand = total_inner = total_outer = 0 # num pixels actually selected/changed
+    run_iter = tqdm(range(runs)) if verbose else range(runs)
+    for _ in run_iter:
+        img_id = np.random.randint(0,500_000)
+        inner_res, rand_res = both_pixels_response(net, dataset, num_pixels, width, img_id=img_id,
+                         one_class=True, outer=False, no_plot=True, batch_size=batch_size)
+        outer_res, rand_res = both_pixels_response(net, dataset, num_pixels, width, img_id=img_id,
+                         one_class=True, outer=True, no_plot=True, batch_size=batch_size)
+        changed_rand += rand_res[0]
+        changed_inner += inner_res[0]
+        changed_outer += outer_res[0]
+        total_rand += rand_res[1]
+        total_inner += inner_res[1]
+        total_outer += outer_res[1]
+    total_amt = runs*255
+    _pct = lambda c: c/total_amt*100.
+    if verbose:
+        print("Inner circle:", _pct(changed_inner))
+        print("Outer circle:", _pct(changed_outer))
+        print("Random baseline:", _pct(changed_rand))
+    return _pct(changed_inner), total_inner/runs, _pct(changed_outer), total_outer/runs, _pct(changed_rand), total_rand/runs
+
+
+def region_importance(net, dataset, batch_size=128, runs=1000):
+    widths = list(range(3,20,3))
+    #pixel_nums = list(range(10,100,10))
+    #pixel_nums.extend(list(range(100,1000,100)))
+    #pixel_nums.extend(list(range(1000,10000,1000)))
+    full_results = []
+    for w in tqdm(widths):
+        full_results.append(region_importance_exp(net, dataset, 1, w, batch_size=batch_size, runs=runs))
+    full_results = np.asarray(full_results)
+    return full_results, widths
+
+
+def plot_region_importance(full_results, widths, pixel_nums):
+    colors = ["coral", "forestgreen", "royalblue"]
+    plt.figure(figsize=(15,15))
+    types = ["Inner", "Outer", "Rand"]
+    shape = utils.find_good_ratio(len(widths))
+    for i, w in enumerate(widths):
+        plt.subplot(*shape, i+1)
+        plt.xscale("log")
+        plt.xlabel("Log10(num_pixels)")
+        plt.ylabel("%Altered")
+        plt.title(f"Width {w}")
+        for j, (pixel_type, color) in enumerate(zip(types,colors)):
+            plt.scatter(full_results[i, :, j*2+1], full_results[i, :, j*2], color=color, label=pixel_type)
+        if i//shape[1] == 0 and i%shape[1] == shape[1]-1:
+            plt.legend()
+
+
+
 # Network training curve plots
 
 
@@ -746,7 +979,7 @@ def defaultdict_helper():  # to make things pickle-able
     return defaultdict(int)
 
 
-def final_activation_tracker(net, loss, optimizer, loader, device=None):
+def final_activation_tracker(net, loss, dataset):
     # final hidden layer activations
     net.eval()
     final_fc_name = f"fully_connected.{len(net.fully_connected)-2}."
@@ -761,9 +994,9 @@ def final_activation_tracker(net, loss, optimizer, loader, device=None):
     final_outputs = []
     post_relu_grads = []
     pre_relu_grads = []
-    for i, sample in tqdm(enumerate(loader)):
-        imgs = sample["image"].to(device).float()
-        labels = sample["label"].to(device)
+    for i, sample in tqdm(enumerate(dataset.dataloader())):
+        imgs = sample["image"].to(dataset.cfg.device).float()
+        labels = sample["label"].to(dataset.cfg.device)
         colors = sample["color"]
         output = debug_net(imgs)
         batch_loss = loss(output, labels)
