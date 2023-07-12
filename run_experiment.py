@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-from training import run_experiments, run_experiment
-from color_regions import ColorDatasetGenerator, hard_color_classifier
-from config_objects import ColorDatasetConfig, ExperimentConfig
+from conv_color.training import run_experiments, run_experiment
+from conv_color.color_regions import ColorDatasetGenerator, hard_color_classifier
+from conv_color.config_objects import ColorDatasetConfig, ExperimentConfig
 import os
 
 torch.backends.cudnn.benchmark = True

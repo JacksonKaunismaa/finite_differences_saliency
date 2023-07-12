@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 import os
-import config_objects
+
+from . import config_objects
 
 class ConvBlock(nn.Module):
     def __init__(self, inpt_shape, layer_params, groups, act_func):
@@ -118,21 +119,28 @@ class ResNet(nn.Module):
         
         self.load_state_dict(new_state_dict)
 
-    def save_model_state_dict(self, best_loss, path=None, optim=None):
+
+    def maybe_save_model_state_dict(self, new_loss=None, new_acc=None, path=None, optim=None, sched=None):
+        if new_loss is not None and new_loss >= self.best_loss:
+            return
+        
         if path is None:
             path = self.path
 
         #path = os.path.join("models", path)
-        self.best_loss = best_loss
+        if new_loss is not None:
+            self.best_loss = new_loss
         save_dict = {"model_sd": self.state_dict(),
                      "config": self.cfg,
                      #"dset_config": self.dset_config,
-                     "best_loss": best_loss}    
+                     "best_loss": self.best_loss}    
         if optim is not None:
             save_dict["optim_sd"] = optim.state_dict()
+        if sched is not None:
+            save_dict["sched_sd"] = sched.state_dict()
         torch.save(save_dict, path)
 
-    def load_model_state_dict(self, path=None, optim=None):
+    def load_model_state_dict(self, path=None, optim=None, sched=None):
         # convert old format
         if path is None:
             path = self.path
@@ -154,6 +162,9 @@ class ResNet(nn.Module):
                 optim.load_state_dict(load_dict[opt_key][0])
             else:
                 optim.load_state_dict(load_dict[opt_key])
+        
+        if sched is not None:
+            sched.load_state_dict(load_dict["sched_sd"])
 
         try:
             if "model_sd" in load_dict: # new version

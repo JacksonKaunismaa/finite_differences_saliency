@@ -5,12 +5,14 @@ from tqdm import tqdm
 import pickle
 import itertools
 import os
-import config_objects
-import network
-import hooks
 import numpy as np
 import wandb
 import dataclasses
+import sklearn.metrics
+
+from . import config_objects
+from . import network
+from . import hooks
 
 def run_experiment(train_dset, valid_dset, name, exp_config: config_objects.ExperimentConfig, extend=False):
     wandb.init(
@@ -100,12 +102,12 @@ def run_experiments(train_dset, valid_dset, experiment_path, hyperparams, prob_d
             
 
 def correct(pred_logits, labels):
-    if labels.shape[1] != 1:
+    if labels.dim() == 2 and labels.shape[1] != 1:
         pred_probabilities = F.softmax(pred_logits, dim=1)
         classifications = torch.argmax(pred_probabilities, dim=1)
         labels_argmax = torch.argmax(labels, dim=1)
     else:
-        classifications = pred_logits.int()
+        classifications = pred_logits.argmax(dim=-1)
         labels_argmax = labels
     correct = (labels_argmax == classifications)
     return correct
@@ -116,20 +118,23 @@ def evaluate(net, loss, dataset):
     epoch_va_loss = 0.0
     epoch_va_correct = 0
     net.eval()
-    total_valid = 0
+    all_labels = torch.empty(0)
+    all_preds = torch.empty(0)
     for i, sample in enumerate(dataset.dataloader()):
         imgs = sample["image"].to(dataset.cfg.device).float()
-        labels = sample["label"].to(dataset.cfg.device).float()
+        labels = sample["label"].to(dataset.cfg.device).long()
         outputs = net(imgs)
         epoch_va_loss += loss(outputs, labels).item()
         epoch_va_correct += correct(outputs, labels).sum().item()
-        total_valid += labels.shape[0]
-    epoch_va_accuracy = epoch_va_correct/total_valid
-    return epoch_va_loss, epoch_va_accuracy
+        all_labels = torch.cat([all_labels, labels.cpu()])
+        all_preds = torch.cat([all_preds, outputs.argmax(dim=-1).cpu()])
+    epoch_va_f1_score = sklearn.metrics.f1_score(all_labels.numpy(), all_preds.numpy(), average="micro")
+    epoch_va_accuracy = epoch_va_correct/all_labels.shape[0]
+    return epoch_va_loss/all_labels.shape[0], epoch_va_accuracy, epoch_va_f1_score
 
 
-def train(net, optimizer, loss, epochs, train_set, valid_set, log_file=None,
-          track_stat=None, summarize=None, test_set=None, verbose=True):
+def train(net, optimizer, loss, epochs, dsets, log_file=None,
+          track_stat=None, summarize=None, test_set=None, verbose=True, scheduler=None):
     va_losses = []
     tr_losses = []
     extra_stats = []
@@ -140,20 +145,25 @@ def train(net, optimizer, loss, epochs, train_set, valid_set, log_file=None,
         epoch_tr_loss = 0.0
         net.train()
         #input("Entering train")
-        for i, sample in tqdm(enumerate(train_set.dataloader())):
-            imgs = sample["image"].to(train_set.cfg.device, non_blocking=False).float()
-            labels = sample["label"].to(train_set.cfg.device).float()
+        total_train = 0
+        for i, sample in tqdm(enumerate(dsets["train"].dataloader())):
+            imgs = sample["image"].to(dsets["train"].cfg.device, non_blocking=False).float()
+            labels = sample["label"].to(dsets["train"].cfg.device).long()
+            total_train += labels.shape[0]
             outputs = net(imgs)
             batch_loss = loss(outputs, labels)
             epoch_tr_loss += batch_loss.item()
             batch_loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-        epoch_va_loss, epoch_va_accuracy = evaluate(net, loss, valid_set)
+        if scheduler is not None:
+            scheduler.step()
+        epoch_va_loss, epoch_va_accuracy, epoch_va_f1_score = evaluate(net, loss, dsets["valid"])
+        epoch_tr_loss = epoch_tr_loss / total_train
         epoch_summary = f'Epoch {epoch + 1}: va_loss: {epoch_va_loss}, va_accuracy: {epoch_va_accuracy}, tr_loss: {epoch_tr_loss}'
         #input("Entering extra")
         if track_stat is not None:
-            track_dataset = test_set if test_set is not None else valid_set
+            track_dataset = test_set if test_set is not None else dsets["valid"]
             curr_stat = track_stat(net, loss, optimizer, track_dataset)
             if summarize is not None:
                 summary_stat = summarize(curr_stat)
@@ -164,9 +174,14 @@ def train(net, optimizer, loss, epochs, train_set, valid_set, log_file=None,
             epoch_summary += f", curr_stat: {summary_stat}"
         if verbose:
             print(epoch_summary)
-        if epoch_va_loss < net.best_loss:
-            net.save_model_state_dict(epoch_va_loss, optim=optimizer)
-        wandb.log({"va_loss": epoch_va_loss, "va_acc": epoch_va_accuracy, "tr_loss": epoch_tr_loss})
+
+        net.maybe_save_model_state_dict(new_loss=epoch_va_loss, new_acc=epoch_va_accuracy, optim=optimizer, sched=scheduler)
+
+        wandb.log({"va_loss": epoch_va_loss, 
+                   "va_acc": epoch_va_accuracy, 
+                   "tr_loss": epoch_tr_loss,
+                   "va_f1_score": epoch_va_f1_score,
+                   "lr": optimizer.param_groups[0]["lr"]})
         va_losses.append(epoch_va_loss)
         tr_losses.append(epoch_tr_loss)
         va_accuracies.append(epoch_va_accuracy)

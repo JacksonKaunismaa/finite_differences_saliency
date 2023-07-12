@@ -10,7 +10,9 @@ class ExperimentConfig:
     global_avg_pooling: bool = False
 
     # Training params
-    learn_rate: float = 1e-3
+    lr_min: float = 1e-7
+    lr_max: float = 1e-4
+    t_warmup: int = 10
     weight_decay: float = 0
     gain: float = 0
     epochs: int = 50
@@ -52,3 +54,11 @@ class ColorDatasetConfig:
     permute_seed: int = 0  # for permuted pixels, seeds used to create the fixed permutations
     batch_size: int = 32
     num_workers: int = 6
+
+
+@dataclass
+class ImageDatasetCfg:
+    batch_size: int = 32
+    num_workers: int = 4
+    data_dir: str = ""
+    device: str = ""

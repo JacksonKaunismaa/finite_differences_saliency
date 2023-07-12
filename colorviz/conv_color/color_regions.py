@@ -6,9 +6,10 @@ import imageio
 import scipy.ndimage
 import os
 from tqdm import tqdm
-import config_objects
 import copy
 from torchvision import transforms
+
+from . import config_objects
 
 def hard_color_classifier(color):  
     if color <= 30:  # 3 classes

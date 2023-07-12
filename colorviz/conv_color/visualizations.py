@@ -3,32 +3,48 @@ from sklearn.preprocessing import StandardScaler
 from sklearn import decomposition
 from scipy.interpolate import RegularGridInterpolator
 import torch
+import torch.utils.data
 from tqdm import tqdm
-from hooks import AllActivations
-import utils
-import training
 import matplotlib.pyplot as plt
 import warnings
 from collections import defaultdict
 from scipy.optimize import minimize
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.colors import LightSource
-import time
+from tensorflow.python.data.ops.dataset_ops import BatchDataset
+
+from .hooks import AllActivations
+from . import utils
+from . import training
 #from mayavi import mlab  # only works when running locally
 # PCA Stuff
 
 
 def find_pca_directions(dataset, sample_size, scales, strides, num_components=4):
 # begin by computing pca directions and d_output_d_alphas
-    sample = []
-    for _ in range(sample_size):
-        sample.append(dataset.generate_one()[0])
-    sample = np.array(sample).squeeze().astype(np.float32)
-    im_size = dataset.cfg.size
+    if isinstance(dataset, torch.utils.data.Dataset):
+        sample = []
+        for _ in range(sample_size):
+            sample.append(dataset.generate_one()[0])
+        print(set(x.shape for x in sample))
+        sample = np.asarray(sample).squeeze().astype(np.float16)
+    elif isinstance(dataset, BatchDataset):
+        batch_size = dataset._batch_size.numpy()
+        samples_needed = sample_size // batch_size
+        print("samples need", samples_needed)
+        sample = [s[0].numpy() for s, i in zip(dataset, range(samples_needed))]  # use zip to limit the iteration length
+        print("samples list done")
+        sample = np.concatenate(sample).astype(np.float16)
+        print("did the sample fine")
+    else:
+        raise NotImplemented(f"Unknown dataset type {type(dataset)}")
+    im_size = sample.shape[1]
+    im_channels = sample.shape[-1]
 
     if isinstance(strides, int):
         strides = [strides]*len(scales)
 
+    print("Got sample, beginning directions")
     pca_direction_grids = []
     for scale, stride in zip(scales, strides):
         windows = np.lib.stride_tricks.sliding_window_view(sample, (scale,scale), axis=(1,2))
@@ -36,7 +52,7 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
 
         xs = np.mgrid[scale:im_size:stride]  # technically wrong (but its shape is correct)
         num_grid = xs.shape[0]
-        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, dataset.cfg.channels))
+        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, im_channels))
 
         pca_fitter = decomposition.PCA(n_components=num_components, copy=False)
         scale_fitter = StandardScaler()
@@ -49,7 +65,7 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
                     warnings.simplefilter("ignore")  # gives pointless zero-division warnings
                     pca_fitter.fit(normalized)
                 for comp in range(num_components):
-                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, dataset.cfg.channels)
+                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, im_channels)
 
         pca_direction_grids.append(pca_direction_grid.copy())
     return pca_direction_grids
@@ -599,7 +615,9 @@ def get_weight(net, weight_name, merge_batchnorms=False):
 def show_fully_connected(net, weight_name):
     pass
 
-def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, size_mul=6, rm_border=True, fixed_height=False, full_gridspec=False, merge_batchnorms=True):
+def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, size_mul=6, 
+                      rm_border=True, fixed_height=False, full_gridspec=False, merge_batchnorms=True,
+                      show_scale=True):
     # assume net it already has AllActivations hooks on it
     # implicitly assume that channel-aligned view is salient for the given network
     weights = get_weight(net, weight_name, merge_batchnorms=merge_batchnorms)   # N_out, N_in, K, K
@@ -613,7 +631,8 @@ def show_conv_weights(net, weight_name, color_profile=None, outer_shape=None, si
             return grid_w
         #print("gw", grid_w.shape)
         return np.concatenate(np.concatenate(grid_w, 1), 1)
-    show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul, rm_border, fixed_height, full_gridspec=full_gridspec)
+    show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, 
+                 size_mul, rm_border, fixed_height, show_scale=show_scale, full_gridspec=full_gridspec)
 
 
 def show_fc_conv(net, weight_name="fully_connected.0.act_func", size_mul=1, color_profile=None, rm_border=True,
@@ -645,7 +664,7 @@ def show_fc(net, weight_name, size_mul=1, color_profile=None, rm_border=True, se
 
 
 def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_size, color_profile, size_mul,
-                 rm_border, fixed_height, selection=None, full_gridspec=False):
+                 rm_border, fixed_height, selection=None, full_gridspec=False, show_scale=False):
     if selection is None:
         selection = np.arange(outer_shape[0]*outer_shape[1])
     if not isinstance(size_mul, tuple):
@@ -691,7 +710,7 @@ def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_s
                 for i in range(inner_shape[0]):
                     for j in range(inner_shape[1]):
                         #print(weights.shape, weights[channel].shape, "reshaper(w[c])")
-                        utils.imshow_centered_colorbar(reshaper(weights[channel])[i,j], colorbar=False,
+                        utils.imshow_centered_colorbar(reshaper(weights[channel])[i,j], colorbar=show_scale,
                                                     ax=sub_axes[i,j], rm_border=False)
                 axes[gs_idx].set_xticks([])
                 axes[gs_idx].set_yticks([])
@@ -699,7 +718,7 @@ def show_weights(weights, weight_name, reshaper, inner_shape, outer_shape, map_s
                     utils.remove_borders(axes[gs_idx])
             else:
                 utils.imshow_centered_colorbar(reshaper(weights[channel]), line_width=map_size if map_size > 1 else 0,
-                                        colorbar=True, ax=axes[gs_idx], rm_border=rm_border)
+                                        colorbar=show_scale, ax=axes[gs_idx], rm_border=rm_border)
             if color_profile:
                 gs_idx = (h*2+1,w) 
                 if w == 0:
