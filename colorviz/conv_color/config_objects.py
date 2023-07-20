@@ -10,13 +10,13 @@ class ExperimentConfig:
     global_avg_pooling: bool = False
 
     # Training params
-    lr_min: float = 1e-7
-    lr_max: float = 1e-4
-    t_warmup: int = 10
-    weight_decay: float = 0
-    gain: float = 0
-    epochs: int = 50
-    batch_size: int = 128
+    lr_decay: float = 0.1  # how much to decay after each milestone
+    lr_max: float = 1e-3   # lr to start off at
+    momentum: float = 0.9  # momentum
+    step_size: int = 7   # how often to drop lr
+    weight_decay: float = 1e-4
+    epochs: int = 250
+    full: bool = False  # whether or not to finetune the full model
 
     def __hash__(self):
         return hash(str(self))

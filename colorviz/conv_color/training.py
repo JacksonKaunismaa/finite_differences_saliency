@@ -8,11 +8,12 @@ import os
 import numpy as np
 import wandb
 import dataclasses
-import sklearn.metrics
+import sklearn.metrics  # type:ignore
 
 from . import config_objects
 from . import network
 from . import hooks
+from . import utils
 
 def run_experiment(train_dset, valid_dset, name, exp_config: config_objects.ExperimentConfig, extend=False):
     wandb.init(
@@ -140,52 +141,69 @@ def train(net, optimizer, loss, epochs, dsets, log_file=None,
     extra_stats = []
     summary_stats = []
     va_accuracies = []
+    non_ddp_net = utils.get_raw(net)
 
     for epoch in range(epochs):
         epoch_tr_loss = 0.0
+        epoch_tr_correct = 0
         net.train()
         #input("Entering train")
         total_train = 0
-        for i, sample in tqdm(enumerate(dsets["train"].dataloader())):
+        if utils.get_rank() == 0:
+            train_iter = tqdm(enumerate(dsets["train"].dataloader()))
+        else:
+            train_iter = enumerate(dsets["train"].dataloader())
+        for i, sample in train_iter:
             imgs = sample["image"].to(dsets["train"].cfg.device, non_blocking=False).float()
             labels = sample["label"].to(dsets["train"].cfg.device).long()
+            # print("rank", utils.get_rank(), "recv batch of", imgs.shape, "means,stds were", imgs.mean((0,2,3)), imgs.std((0,2,3)))
             total_train += labels.shape[0]
             outputs = net(imgs)
             batch_loss = loss(outputs, labels)
             epoch_tr_loss += batch_loss.item()
+            epoch_tr_correct += correct(outputs, labels).sum().item()
             batch_loss.backward()
             optimizer.step()
             optimizer.zero_grad()
         if scheduler is not None:
             scheduler.step()
-        epoch_va_loss, epoch_va_accuracy, epoch_va_f1_score = evaluate(net, loss, dsets["valid"])
-        epoch_tr_loss = epoch_tr_loss / total_train
-        epoch_summary = f'Epoch {epoch + 1}: va_loss: {epoch_va_loss}, va_accuracy: {epoch_va_accuracy}, tr_loss: {epoch_tr_loss}'
-        #input("Entering extra")
-        if track_stat is not None:
-            track_dataset = test_set if test_set is not None else dsets["valid"]
-            curr_stat = track_stat(net, loss, optimizer, track_dataset)
-            if summarize is not None:
-                summary_stat = summarize(curr_stat)
+        if utils.get_rank() == 0:
+            epoch_va_loss, epoch_va_accuracy, epoch_va_f1_score = evaluate(net, loss, dsets["valid"])
+            epoch_tr_loss = epoch_tr_loss / total_train
+            epoch_tr_accuracy = epoch_tr_correct / total_train
+            epoch_summary = f'Epoch {epoch + 1}: va_loss: {epoch_va_loss}, va_accuracy: {epoch_va_accuracy}, tr_loss: {epoch_tr_loss}, tr_acc: {epoch_tr_accuracy}'
+            #input("Entering extra")
+            if track_stat is not None:
+                track_dataset = test_set if test_set is not None else dsets["valid"]
+                curr_stat = track_stat(net, loss, optimizer, track_dataset)
+                if summarize is not None:
+                    summary_stat = summarize(curr_stat)
+                else:
+                    summary_stat = curr_stat
+                extra_stats.append(curr_stat)
+                summary_stats.append(summary_stat)
+                epoch_summary += f", curr_stat: {summary_stat}"
+            if verbose:
+                print(epoch_summary)
+
+            non_ddp_net.maybe_save_model_state_dict(new_loss=epoch_va_loss, new_acc=epoch_va_accuracy, optim=optimizer, sched=scheduler)
+            
+            if isinstance(non_ddp_net.model.classifier[1], nn.Sequential):
+                norm_dict = {"classifier_norm": non_ddp_net.model.classifier[1][-1].weight.norm(dim=1).mean().item()}
             else:
-                summary_stat = curr_stat
-            extra_stats.append(curr_stat)
-            summary_stats.append(summary_stat)
-            epoch_summary += f", curr_stat: {summary_stat}"
-        if verbose:
-            print(epoch_summary)
+                norm_dict = {"classifier_norm": non_ddp_net.model.classifier[1].weight.norm(dim=1).mean().item()}
 
-        net.maybe_save_model_state_dict(new_loss=epoch_va_loss, new_acc=epoch_va_accuracy, optim=optimizer, sched=scheduler)
-
-        wandb.log({"va_loss": epoch_va_loss, 
-                   "va_acc": epoch_va_accuracy, 
-                   "tr_loss": epoch_tr_loss,
-                   "va_f1_score": epoch_va_f1_score,
-                   "lr": optimizer.param_groups[0]["lr"]})
-        va_losses.append(epoch_va_loss)
-        tr_losses.append(epoch_tr_loss)
-        va_accuracies.append(epoch_va_accuracy)
-        if log_file is not None:
-            with open(log_file, "wb") as p:
-                pickle.dump((va_losses, va_accuracies, tr_losses, extra_stats, summary_stats), p)
+            wandb.log({"va_loss": epoch_va_loss, 
+                    "va_acc": epoch_va_accuracy, 
+                    "tr_loss": epoch_tr_loss,
+                    "tr_acc": epoch_tr_accuracy,
+                    "va_f1_score": epoch_va_f1_score,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    **norm_dict})
+            va_losses.append(epoch_va_loss)
+            tr_losses.append(epoch_tr_loss)
+            va_accuracies.append(epoch_va_accuracy)
+            if log_file is not None:
+                with open(log_file, "wb") as p:
+                    pickle.dump((va_losses, va_accuracies, tr_losses, extra_stats, summary_stats), p)
     return va_losses, va_accuracies, tr_losses, extra_stats, summary_stats

@@ -1,7 +1,30 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch._dynamo.eval_frame import OptimizedModule
 
+
+def get_rank():  # consider making this a decorator (with a parameter that specifies a default return value)
+    try:
+        return dist.get_rank()
+    except RuntimeError:
+        return 0
+
+def get_world_size():
+    try:
+        return dist.get_world_size()
+    except RuntimeError:
+        return 1
+    
+def get_raw(net): # slightly awkward way to consistently access underyling Transformer object
+    if isinstance(net, OptimizedModule):
+        net = net._modules["_orig_mod"]
+    if isinstance(net, DDP):
+        net = net.module
+    return net
+    
 
 def remove_borders(ax, borders=None):
     if borders is None:

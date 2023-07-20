@@ -7,3 +7,5 @@ logs/*
 *.pdf
 *.log
 wandb/
+**/__pycache__
+checkpoint/*
