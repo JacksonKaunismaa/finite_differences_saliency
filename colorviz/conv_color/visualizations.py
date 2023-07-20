@@ -447,9 +447,10 @@ def compute_profile_plot(profile, dataset):
     return avg_line, color_values, classes, profile, stds
 
 
-def get_profile_y_lims(profile_plot):
+def get_profile_y_lims(profile_plot): # assumes y values are all positive
     avg_line, color_values, classes, profile, stds = profile_plot
-    max_y = min(max(avg_line)*1.3, max(profile[:,1]))
+
+    max_y = min(max(avg_line)*(1+0.3*np.sign(max(avg_line))), max(profile[:,1]))
     min_y = max(min(avg_line)*(1-0.3*np.sign(min(avg_line))), min(profile[:,1]))
     return min_y, max_y
 
@@ -558,14 +559,14 @@ def activation_color_profile(net, dataset):
         net(imgs)
 
         for layer_name, activation in net._features.items():
-            for i, color in enumerate(colors):
-                # ignore batchnorms, and pre-activation func
-                if "act_func" in layer_name: # happens to be identical implementation for fully_connected
-                    for channel in range(activation.shape[1]):
-                        entry = color.item(), activation[i][channel].mean().item() # could do group conv to give data on input channels?
-                        filter_activations[f"{layer_name}_{channel}"].append(entry)  # should be mean so that activation doesn't scale with map size
-                else:
-                    break
+            layer_type = layer_name.split(".")[-1]  # truly horrible code
+            # if layer_type not in ["fully_connected", "batch_norm1", "batch_norm2"]:  # look at fc logits, and post-batchnorms
+            #     continue
+            for b, color in enumerate(colors):  # b corresponds to batch dimension
+                for channel in range(activation.shape[1]):  # for fc layers, this gives the value per logit (mean of 1 value)
+                    entry = color.item(), activation[b][channel].mean().item() # could do group conv to give data on input channels?
+                    filter_activations[f"{layer_name}_{channel}"].append(entry)  # should be mean so that activation doesn't scale with map size
+
     filter_activations = {k:np.asarray(v) for k,v in filter_activations.items()}
     profile_plots = {k:compute_profile_plot(filter_activations[k], dataset) for k in filter_activations.keys()}
     return profile_plots, filter_activations

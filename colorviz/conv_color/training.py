@@ -123,7 +123,7 @@ def evaluate(net, loss, dataset):
     all_preds = torch.empty(0)
     for i, sample in enumerate(dataset.dataloader()):
         imgs = sample["image"].to(dataset.cfg.device).float()
-        labels = sample["label"].to(dataset.cfg.device).long()
+        labels = sample["label"].to(dataset.cfg.device).argmax(dim=-1)  # breaks multi-hot encoded stuff
         outputs = net(imgs)
         epoch_va_loss += loss(outputs, labels).item()
         epoch_va_correct += correct(outputs, labels).sum().item()
