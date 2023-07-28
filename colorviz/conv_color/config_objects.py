@@ -17,6 +17,7 @@ class ExperimentConfig:
     weight_decay: float = 1e-4
     epochs: int = 250
     full: bool = False  # whether or not to finetune the full model
+    gain: float = 0.1  # gain to use on weight initialization
 
     def __hash__(self):
         return hash(str(self))
