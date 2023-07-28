@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import colorsys
-import imageio
+# import imageio
 import scipy.ndimage
 import os
 from tqdm import tqdm

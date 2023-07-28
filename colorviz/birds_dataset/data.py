@@ -49,7 +49,9 @@ class ImageDataset(Dataset):
     
     def generate_one(self):
         idx = np.random.randint(len(self))
-        return self.images[idx], self.labels[idx]
+        while (result:=self[idx]) is None:
+            idx = np.random.randint(len(self))
+        return result['image'].numpy().transpose(1,2,0), result['label']
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
@@ -58,8 +60,8 @@ class ImageDataset(Dataset):
         # bad practice, since we are replicating what transform.ToTensor does since that somehow doesn't work well with read_image
         image = read_image(im_name).float()/255.
         label = self.class_name_to_idx[osp.basename(osp.dirname(im_name))]
-        if np.random.randint(0,{'train': 50, 'valid': 2}[self.split]) == 0 and label in range(0,500,83):
-            print("sampled image", im_name, "label", label, "in split", self.split)
+        # if np.random.randint(0,{'train': 50, 'valid': 2}[self.split]) == 0 and label in range(0,500,83):
+        #     print("sampled image", im_name, "label", label, "in split", self.split)
         if hasattr(self, "transform"):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -71,11 +73,4 @@ class ImageDataset(Dataset):
         return sample
 
     def implicit_normalization(self, inpt):
-        # since TextureDatasetGenerator.generate_one returns np.uint8 (since it copies from a loaded image), transforms.ToTensor()
-        # will implicitly do a divide by 255. Since we work in [0, 255] space for basically everything, this function is provided
-        # for convenience and should be called just before we pass any tensor into the model. (This means that networks using this
-        # dataset are working in [0, 1] space). The one exception to this is when
-        # you have already called utils.tensorize on the image, which replicates the behaviour of transforms.ToTensor() (but with
-        # better handling of adding dimensions/transposing) and thus will also implicitly do the divide by 255 operation (if the input
-        # type is np.uint8). In summary, always call either utils.tensorize xor this function before passing into the model.
-        return inpt/255.
+        return inpt

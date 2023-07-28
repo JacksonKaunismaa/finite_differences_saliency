@@ -4,7 +4,7 @@ from sklearn import decomposition
 from scipy.interpolate import RegularGridInterpolator
 import torch
 import torch.utils.data
-from tqdm import tqdm
+from tqdm import tqdm, trange
 import matplotlib.pyplot as plt
 import warnings
 from collections import defaultdict
@@ -24,17 +24,17 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
 # begin by computing pca directions and d_output_d_alphas
     if isinstance(dataset, torch.utils.data.Dataset):
         sample = []
-        for _ in range(sample_size):
+        for _ in trange(sample_size):
             sample.append(dataset.generate_one()[0])
         print(set(x.shape for x in sample))
-        sample = np.asarray(sample).squeeze().astype(np.float16)
+        sample = np.asarray(sample).squeeze().astype(np.float32)
     elif isinstance(dataset, BatchDataset):
         batch_size = dataset._batch_size.numpy()
         samples_needed = sample_size // batch_size
         print("samples need", samples_needed)
         sample = [s[0].numpy() for s, i in zip(dataset, range(samples_needed))]  # use zip to limit the iteration length
         print("samples list done")
-        sample = np.concatenate(sample).astype(np.float16)
+        sample = np.concatenate(sample).astype(np.float32)
         print("did the sample fine")
     else:
         raise NotImplemented(f"Unknown dataset type {type(dataset)}")
