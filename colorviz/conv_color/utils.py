@@ -52,17 +52,30 @@ def find_good_ratio(size): # find ratio as close to a square as possible
     height = size//width
     return min(height, width), max(height, width)  # height, width
 
+def image_grid(img_list):  # plot a grid of images, with img_list being flat
+    height, width = find_good_ratio(len(img_list))
+    for i in range(height):
+        for j in range(width):
+            idx = i*width + j + 1
+            plt.subplot(height, width, idx)
+            plt.imshow(img_list[idx])
+            remove_borders(plt.gca())
 
-def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, first_cmap=None, channel_mode=None):
+
+def plt_grid_figure(inpt_grid, col_titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, 
+                    first_cmap=None, channel_mode=None, row_titles=None, crop_to=None, zero_centered_cmap=True):
+    # plot a grid of images (inpt grid must be in the shape you want the images to display in)
+    # inpt_grid.shape == (N_vert, N_horiz, img_height, img_width)
     #np_grid = np.array(grid).squeeze()
     #if len(np_grid.shape) != 4:
     #    np_grid = np.expand_dims(np_grid, 0)
     #if transpose:
     #    np_grid = np_grid.transpose(1,0,2,3)
-    if not isinstance(inpt_grid[0], list):
+    if not isinstance(inpt_grid[0], (list, np.ndarray)):
         inpt_grid = [inpt_grid]
     if cmap is None:
         cmap = "bwr"
+        
 
     nrows = len(inpt_grid[0]) if transpose else len(inpt_grid)
     if channel_mode not in ["split", "collapse"] and not isinstance(channel_mode, int) and channel_mode is not None:
@@ -70,48 +83,58 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
 
     if channel_mode == "split":
         grid = [[] for _ in range(nrows)]
-        expanded_titles = []
+        expanded_col_titles = []
         for i, row in enumerate(inpt_grid):
             for j, img in enumerate(row):
                 idx = (j,i) if transpose else (i,j)
-                #print("on idx", i,j)
+                # print("on idx", idx, "img_shape", img.shape)
                 if idx[1] != 0 and img.ndim == 3:  # not in first column
-                    #print("decided to do some expanding, curr_len", len(grid[idx[0]]))
+                    # print("decided to do some expanding, curr_len", len(grid[idx[0]]))
                     expanded_view = [channel_view for channel_view in img.transpose(2,0,1)]
-                    #print("expandend_amount", len(expanded_view))
+                    # print("expandend_amount", len(expanded_view), len(grid[idx[0]]))
                     grid[idx[0]] += expanded_view  # ie. assume HWC
+                    # print("len(grid[idx[0]])", len(grid[idx[0]]))
                     if idx[0] == 0:  # in first row
                         #print("expanding titles also", len(titles), j, len(row))
-                        expanded_titles += [f"Channel {c} {titles[idx[1]]}" for c in range(len(expanded_view))]
+                        expanded_col_titles += [f"Channel {c} {col_titles[idx[1]] if col_titles else ''}" for c in range(len(expanded_view))]
                 else:
                     grid[idx[0]].append(img)
-                    if idx[0] == 0:
-                        expanded_titles.append(titles[idx[1]])
-        titles = expanded_titles
+                    if idx[0] == 0 and col_titles:
+                        expanded_col_titles.append(col_titles[idx[1]])
+        col_titles = expanded_col_titles
     else:
         grid = inpt_grid
 
     #print([len(x) for x in grid])
-    im_size = grid[0][0].shape[0]
+
+    im_size = crop_to if crop_to else grid[0][0].shape[0]
+
     ncols = len(grid) if transpose and not channel_mode == "split" else len(grid[0])
 
     #print(expanded_titles, len(expanded_titles))
-    print(nrows, ncols, im_size)
+    print(f"{nrows=}, {ncols=}, {im_size=}")
     fig = plt.figure(figsize=(4/128*im_size*ncols, 5/128*im_size*nrows))
     gridspec = fig.add_gridspec(nrows, ncols, hspace=hspace)
     axes = gridspec.subplots(sharex="col", sharey="row")
     if len(axes.shape) == 1:
         axes = np.expand_dims(axes, 0)
-    print(axes.shape)
+    print(f"{axes.shape=}")
     for i, row in enumerate(grid):
         for j, unsqueezed_img in enumerate(row):
             img = unsqueezed_img.squeeze()
+            if crop_to is not None:
+                # print(img.shape)
+                im_actual_size = img.shape[0]
+                crop_amt = (im_actual_size - crop_to)//2
+                img = img[crop_amt:-crop_amt, crop_amt:-crop_amt]
+                # print(img.shape, crop_amt, im_actual_size, i, j)
             idx = (j,i) if transpose and not channel_mode == "split" else (i,j)  # split_channels already accounts for transpose
             axes[idx].set_xticks([])
             axes[idx].set_yticks([])
             remove_borders(axes[idx])
             if idx[1] == 0: # assume explain_img is the first thing
                 if len(img.shape) == 3 and img.shape[2] == 3:
+                    # print(img.shape)
                     im = axes[idx].imshow(img)
                 else:
                     if first_cmap is None:
@@ -125,13 +148,19 @@ def plt_grid_figure(inpt_grid, titles=None, colorbar=True, cmap=None, transpose=
 
                 img_max = np.max(abs(img))
                 if cmap != "gray":
-                    im = axes[idx].imshow(img, cmap=cmap, interpolation="nearest", vmax=img_max, vmin=-img_max)
+                    # print(img.sum())
+                    if zero_centered_cmap:
+                        im = axes[idx].imshow(img, cmap=cmap, vmax=img_max, vmin=-img_max) # interpolation='nearest'
+                    else:
+                        im = axes[idx].imshow(img, cmap=cmap)
                 else:
                     axes[idx].imshow(img, cmap=cmap)
                 if colorbar:
                     plt.colorbar(im, pad=0, fraction=0.048)
-            if titles and idx[0] == 0:
-                axes[idx].set_title(titles[idx[1]])
+            if col_titles and idx[0] == 0:
+                axes[idx].set_title(col_titles[idx[1]])
+            if row_titles and idx[1] == 0:
+                axes[idx].set_ylabel(row_titles[idx[0]])
     #plt.show()
 
 

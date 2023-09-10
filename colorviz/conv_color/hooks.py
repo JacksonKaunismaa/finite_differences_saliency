@@ -133,7 +133,7 @@ class GuidedBackprop(HookAdder):
     def relu_backward_hook_creater(self, name):
         #print("potentiall adding to", name)
         def _relu_backward_hook(module, grad_in, grad_out):
-            if not isinstance(module, nn.ReLU) or name in self.exceptions:  # only consider ReLUs
+            if not isinstance(module, (nn.ReLU, nn.SiLU)) or name in self.exceptions:  # only consider ReLUs
                 return
             #print("guided_backprop on", name)
             #print("R^{l+1} is", grad_in[0], abs(grad_in[0]).max())
@@ -149,9 +149,10 @@ class GuidedBackprop(HookAdder):
 
     def relu_forward_hook_creater(self, name):
         def _relu_forward_hook(module, inpt, outpt):
-            if not isinstance(module, nn.ReLU) or name in self.exceptions:
+            if not isinstance(module, (nn.ReLU, nn.SiLU)) or name in self.exceptions:
                 return
             self.forward_relu_outputs.append(outpt)
+        return _relu_forward_hook
 
 def set_initializers(mod, gain):
     has_sub_mods = False

@@ -46,20 +46,24 @@ class ImageDataset(Dataset):
 
     def __len__(self):
         return len(self.image_names)
+
+    def load_raw(self, idx):
+        im_name = self.image_names[idx]
+        # bad practice, since we are replicating what transform.ToTensor does since that somehow doesn't work well with read_image
+        image = read_image(im_name).float()/255.
+        label = self.class_name_to_idx[osp.basename(osp.dirname(im_name))]
+        return image, label
     
     def generate_one(self):
         idx = np.random.randint(len(self))
         while (result:=self[idx]) is None:
             idx = np.random.randint(len(self))
-        return result['image'].numpy().transpose(1,2,0), result['label']
+        return result['image'].numpy().transpose(1,2,0), result['label'], idx
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        im_name = self.image_names[idx]
-        # bad practice, since we are replicating what transform.ToTensor does since that somehow doesn't work well with read_image
-        image = read_image(im_name).float()/255.
-        label = self.class_name_to_idx[osp.basename(osp.dirname(im_name))]
+        image,label = self.load_raw(idx)
         # if np.random.randint(0,{'train': 50, 'valid': 2}[self.split]) == 0 and label in range(0,500,83):
         #     print("sampled image", im_name, "label", label, "in split", self.split)
         if hasattr(self, "transform"):

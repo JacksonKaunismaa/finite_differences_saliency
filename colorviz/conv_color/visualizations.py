@@ -12,6 +12,8 @@ from scipy.optimize import minimize
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.colors import LightSource
 from tensorflow.python.data.ops.dataset_ops import BatchDataset
+import multiprocessing as mp
+
 
 from .hooks import AllActivations
 from . import utils
@@ -20,8 +22,8 @@ from . import training
 # PCA Stuff
 
 
-def find_pca_directions(dataset, sample_size, scales, strides, num_components=4):
-# begin by computing pca directions and d_output_d_alphas
+def get_sample_for_pca(sample_size, dataset):
+    # begin by computing pca directions and d_output_d_alphas
     if isinstance(dataset, torch.utils.data.Dataset):
         sample = []
         for _ in trange(sample_size):
@@ -38,8 +40,13 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
         print("did the sample fine")
     else:
         raise NotImplemented(f"Unknown dataset type {type(dataset)}")
-    im_size = sample.shape[1]
-    im_channels = sample.shape[-1]
+    return sample
+
+def find_pca_directions(dataset, scales, strides, sample=None, num_components=4, split_channels=False):
+    if isinstance(sample, int):  # if a sample is not pre-provided, 'sample' is treated as the sample size to use
+        sample = get_sample_for_pca(sample, dataset)
+    sample_size = sample.shape[0]  # sample is [N, H, W, C]
+    im_channels = sample.shape[-1] if sample.ndim == 4 else 1
 
     if isinstance(strides, int):
         strides = [strides]*len(scales)
@@ -47,94 +54,46 @@ def find_pca_directions(dataset, sample_size, scales, strides, num_components=4)
     print("Got sample, beginning directions")
     pca_direction_grids = []
     for scale, stride in zip(scales, strides):
-        windows = np.lib.stride_tricks.sliding_window_view(sample, (scale,scale), axis=(1,2))
-        strided_windows = windows[:, ::stride, ::stride, :]  # [N, H, W, C]
+        windows = np.lib.stride_tricks.sliding_window_view(sample, (scale,scale), axis=(1,2)) 
+        strided_windows = windows[:, ::stride, ::stride, :]  # [N, abs_posx, abs_posy, C?, within_windowx, within_windowy]
 
-        xs = np.mgrid[scale:im_size:stride]  # technically wrong (but its shape is correct)
-        num_grid = xs.shape[0]
-        pca_direction_grid = np.zeros((num_grid, num_grid, num_components, scale, scale, im_channels))
-
+        pca_direction_grid = np.zeros((strided_windows.shape[1], strided_windows.shape[2], 
+                                       num_components, scale, scale, im_channels))
         pca_fitter = decomposition.PCA(n_components=num_components, copy=False)
         scale_fitter = StandardScaler()
-        for i in tqdm(range(num_grid)):
-            for j in range(num_grid):
-                pca_selection = strided_windows[:, i, j, :]
-                flattened = pca_selection.reshape(sample_size, -1)
-                normalized = scale_fitter.fit_transform(flattened)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")  # gives pointless zero-division warnings
-                    pca_fitter.fit(normalized)
-                for comp in range(num_components):
-                    pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, im_channels)
+        for i in tqdm(range(strided_windows.shape[1])):
+            for j in range(strided_windows.shape[2]):
+                for c in range(im_channels):                          
+                    if strided_windows.ndim == 6:  # ie. like [N, abs_posx, abs_posy, C, within_windowx, within_windowy]
+                        if split_channels:
+                            pca_selection = strided_windows[:, i, j, c] # [N, within_windowx, within_windowy]
+                        else:
+                            pca_selection = strided_windows[:, i, j].transpose(0,2,3,1) #[N, within_windowx, within_windowy, C]
+                    elif strided_windows.ndim == 5: # ie. like [N, abs_posx, abs_posy, within_windowx, within_windowy]
+                        pca_selection = strided_windows[:, i, j]  # [N, within_windowx, within_windowy]
+                    flattened = pca_selection.reshape(sample_size, -1)
+                    normalized = scale_fitter.fit_transform(flattened)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")  # gives pointless zero-division warnings
+                        pca_fitter.fit(normalized)
+                    for comp in range(num_components):
+                        if split_channels:
+                            pca_direction_grid[i, j, comp, ..., c] = pca_fitter.components_[comp].reshape(scale, scale)
+                        else:
+                            pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, im_channels)
+                    if not split_channels:  # if split_channels=False, we don't want to iterate over c
+                        break
+                    
 
         pca_direction_grids.append(pca_direction_grid.copy())
     return pca_direction_grids
 
-def old_old_pca_direction_grids(model, dataset, target_class, img,
-                        sample_size=512, scales=[3,5,9,15],
-                        strides=None, pca_direction_grids=None,
-                       gaussian=False):
-    # begin by computing pca directions and d_output_d_alphas
-    model.eval()
-    im_size = dataset.cfg.size
-    if strides is None:
-        strides = scales
-    if pca_direction_grids is None:
-        pca_direction_grids = find_pca_directions(dataset, sample_size, scales, strides)
-    d_out_d_alpha_grids = []
-    interpolators = []
-    indices_grid = np.mgrid[0:im_size, 0:im_size]
-
-    for s, (scale, stride) in enumerate(zip(scales, strides)):
-        index_window = np.lib.stride_tricks.sliding_window_view(indices_grid, (scale,scale), axis=(1,2))
-        strided_indices = index_window[:, ::stride, ::stride]
-
-        xs = np.mgrid[0:im_size-scale:stride]
-        num_grid = xs.shape[0]
-        #print(xs, num_grid)
-        d_out_d_alpha_grid = np.zeros((num_grid, num_grid))
-        for i in tqdm(range(num_grid)):
-            for j in range(num_grid):
-                # get pca direction for current patch
-                pca_direction = pca_direction_grids[s][i,j,0].transpose(2,0,1)
-                indices = strided_indices[:, i, j, ...]  # will have to slice these
-
-                # do d_output_d_alpha computation
-                alpha = torch.tensor(0.0, requires_grad=True).to(dataset.cfg.device)
-                direction_tensor = torch.tensor(pca_direction).to(dataset.cfg.device).float().unsqueeze(0)
-                img_tensor = torch.tensor(img.transpose(2,0,1)).to(dataset.cfg.device).float().unsqueeze(0)
-                img_tensor[..., indices[0,0,0]:indices[0,-1,-1]+1, indices[1,0,0]:indices[1,-1,-1]+1] += alpha*direction_tensor
-                output = model(img_tensor)[0,target_class]
-                d_out_d_alpha = torch.autograd.grad(output, alpha)[0]
-
-                d_out_d_alpha_grid[i,j] = d_out_d_alpha.detach().cpu().numpy()
-        d_out_d_alpha_grids.append(d_out_d_alpha_grid.copy())
-        interpolators.append(RegularGridInterpolator((xs+scale//2, xs+scale//2), d_out_d_alpha_grid,
-                                                     bounds_error=False, fill_value=None))
-    #print(d_out_d_alpha_grids[-1], d_out_d_alpha_grids[-1].shape)
-    # now, per pixel, interpolate what the d_output_d_alpha value would be if the window
-    # were centered at that pixel, then take the max over all possible scales
-    saliency_map = np.zeros_like(img)
-    scale_wins = [0] * len(scales)
-    for i in tqdm(range(im_size)):
-        for j in range(im_size):
-            best_d_out_d_alpha = 0
-            best_scale = -1
-            for s in range(len(scales)):
-                interp_value = interpolators[s]([i,j])
-                if abs(interp_value) >= abs(best_d_out_d_alpha):
-                    best_d_out_d_alpha = interp_value
-                    best_scale = s
-            saliency_map[i,j] = best_d_out_d_alpha
-            scale_wins[best_scale] += 1
-    print(scale_wins)
-    return saliency_map
 
 def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction_grids,
                         strides=None, gaussian=False, component=0, batch_size=32):
     # begin by computing d_output_d_alphas
     model.eval()
-    im_size = dataset.cfg.size
+    im_size = img.shape[0]
     if strides is None:
         strides = scales
     if isinstance(strides, int):
@@ -297,7 +256,7 @@ def finite_differences_map(model, dataset, target_class, img, unfairness="fair",
                            batch_size=32, num_values=20):
     # generate a saliency map using finite differences method (iterate over colors)
     model.eval()
-    im_size = dataset.cfg.size
+    im_size = img.shape[0]
     #img = img.astype(np.float32)/255. # normalization handled later
     indices = np.mgrid[:im_size, :im_size].transpose(1,2,0).reshape(im_size*im_size, -1)
     stacked_img = np.repeat(np.expand_dims(img, 0), batch_size, axis=0)
@@ -862,7 +821,7 @@ def random_pixels_response(net, dataset, num_pixels, img_id=987_652, one_class=T
     generated_img, lbl, color, size, pos  = dataset.generate_one()
     tensor_img = utils.tensorize(generated_img, device=dataset.cfg.device)
 
-    im_size = dataset.cfg.size
+    im_size = generated_img.shape[0]
     possible_pixels = np.mgrid[:im_size, :im_size].transpose(1,2,0).reshape(im_size*im_size, -1)
     selected_pixels = possible_pixels[np.random.choice(len(possible_pixels), num_pixels, replace=False)]
     num_inside = 0
@@ -907,7 +866,7 @@ def circle_pixels_response(net, dataset, num_pixels, width, img_id=987_652, oute
     possible_indices[:,0] = (pos[0][0] + np.cos(angle)*radii[:,None]).flat
     possible_indices[:,1] = (pos[0][1] + np.sin(angle)*radii[:,None]).flat
     possible_indices = np.round(possible_indices).astype(np.int64)  # all possible pixels we can select (cant do np.unique because slow
-    im_size = dataset.cfg.size
+    im_size = generated_img.shape[0]
     zero_img = np.zeros((im_size, im_size))
     #print(possible_indices.shape)
     zero_img[possible_indices[:,0], possible_indices[:,1]] = 1

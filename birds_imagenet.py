@@ -16,6 +16,7 @@ from colorviz.birds_dataset.data import ImageDataset
 from colorviz.conv_color.config_objects import ImageDatasetCfg, ExperimentConfig
 from colorviz.conv_color import training
 from colorviz.conv_color import utils
+from colorviz.birds_dataset import network
 
 torch.backends.cudnn.benchmark = True
 
@@ -28,70 +29,6 @@ def main(rank, args):
         torch.cuda.set_device(rank)  # so that nccl knows we are only using that specific device
         print("hi from", rank)
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
-
-    class OurEfficientNet(nn.Module):
-        def __init__(self, net: EfficientNet, path: str, exp_cfg: ExperimentConfig, n_classes: int):
-            super().__init__()
-            self.model = net
-
-            if not exp_cfg.full:
-                for param in self.model.parameters():
-                    param.requires_grad = False
-            
-            self.path = path
-            self.cfg = exp_cfg
-            self.best_acc = float("-inf")
-
-            if exp_cfg.fc_layers:
-                net.classifier[1] = nn.Sequential(nn.Linear(net.classifier[1].in_features, exp_cfg.fc_layers[0]),
-                                                nn.ReLU(),
-                                                nn.Linear(exp_cfg.fc_layers[0], n_classes)
-                                                )
-            else:
-                net.classifier[1] = nn.Linear(net.classifier[1].in_features, n_classes)
-
-        def forward(self, x):
-            return self.model(x)
-
-        def maybe_save_model_state_dict(self, new_loss=None, new_acc=None, path=None, optim=None, sched=None):
-            if new_acc is not None and new_acc <= self.best_acc:
-                return
-
-            if path is None:
-                path = self.path
-
-            #path = os.path.join("models", path)
-            if new_acc is not None:
-                self.best_acc = new_acc
-            save_dict = {"model_sd": self.state_dict(),
-                            "config": self.cfg,
-                            #"dset_config": self.dset_config,
-                            "best_acc": self.best_acc}
-            if optim is not None:
-                save_dict["optim_sd"] = optim.state_dict()
-            if sched is not None:
-                save_dict["sched_sd"] = sched.state_dict()
-            torch.save(save_dict, path)
-
-        def load_model_state_dict(net, optim=None, sched=None):
-                print("Found path of", net.path)
-                load_dict = torch.load(net.path)
-
-                if optim is not None:
-                    optim.load_state_dict(load_dict["optim_sd"])
-                if sched is not None:
-                    sched.load_state_dict(load_dict["sched_sd"])
-
-                net.load_state_dict(load_dict["model_sd"])
-
-        def train(self, mode: bool=True):
-            print(".train() called")
-            for module in self.model.modules():
-                if isinstance(module, nn.Linear):
-                    print("set only this guy to", mode)
-                    module.train(mode)
-                else:  # ie. force all other layers to be in evaluation mode except for the classifier
-                    module.train(False)
 
     # lr schedule
     # simplify the task
@@ -132,7 +69,7 @@ def main(rank, args):
                                 full=False,
                                 fc_layers=[2_000])
 
-    net = OurEfficientNet(efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1),
+    net = network.OurEfficientNet(efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1),
                         "./checkpoint/efficientnet_birds.dict", exp_cfg, dsets['train'].num_classes)
 
     # net.eval() # set batchnorms to inference mode (this would just get erased during evaluation anyway)
