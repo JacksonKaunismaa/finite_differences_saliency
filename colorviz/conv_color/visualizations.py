@@ -12,7 +12,7 @@ from scipy.optimize import minimize
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.colors import LightSource
 from tensorflow.python.data.ops.dataset_ops import BatchDataset
-import multiprocessing as mp
+import cv2
 
 
 from .hooks import AllActivations
@@ -20,6 +20,28 @@ from . import utils
 from . import training
 #from mayavi import mlab  # only works when running locally
 # PCA Stuff
+
+def combine_saliency_and_img(img, saliency, channel=0, do_abs=True, alpha=0.4, gamma=0, method="jet"):
+    # combine an image and its saliency map so that they can be simultaneously visualzed
+    # it also only takes a certain channel from the saliency map, since they are usually the same anyway
+    # does a linear blend, can probably do something better
+    saliency = saliency[...,channel]
+    if do_abs:
+        saliency = abs(saliency)
+    centered_saliency = (saliency - saliency.min()) / (saliency.max() - saliency.min())
+    if method == "jet":
+        saliency_bytes = 255 - cv2.convertScaleAbs(centered_saliency*255)
+        saliency_cmapped = cv2.applyColorMap(saliency_bytes, cv2.COLORMAP_JET).astype(img.dtype)/255.
+    elif method == "gray":
+        saliency_bytes = cv2.convertScaleAbs((centered_saliency**3)*255)
+        saliency_cmapped = cv2.cvtColor(saliency_bytes, cv2.COLOR_GRAY2RGB).astype(img.dtype)/255.
+    elif method == "bone":
+        saliency_bytes = cv2.convertScaleAbs(centered_saliency*255)
+        saliency_cmapped = cv2.applyColorMap(saliency_bytes, cv2.COLORMAP_BONE).astype(img.dtype)/255.
+    else:
+        raise ValueError("Unsupported combining method, must be in ['jet', 'gray', 'bone']")
+    blended = cv2.addWeighted(saliency_cmapped, alpha, img, 1-alpha, gamma)
+    return blended
 
 
 def get_sample_for_pca(sample_size, dataset):
@@ -83,19 +105,21 @@ def find_pca_directions(dataset, scales, strides, sample=None, num_components=4,
                             pca_direction_grid[i, j, comp] = pca_fitter.components_[comp].reshape(scale, scale, im_channels)
                     if not split_channels:  # if split_channels=False, we don't want to iterate over c
                         break
-                    
-
         pca_direction_grids.append(pca_direction_grid.copy())
     return pca_direction_grids
 
 
-def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction_grids,
+def pca_direction_grid_saliency(model, dataset, target_class, img, pca_direction_grids,
                         strides=None, gaussian=False, component=0, batch_size=32):
     # begin by computing d_output_d_alphas
+    # note: previous version of pca_direction grids required passing scales as a parameter. It was removed 
+    # since it can be inferred based on pca_direction_grids.
+    # note: this function was renamed to pca_direction_grid_saliency from pca_direction_grids
     model.eval()
     im_size = img.shape[0]
+    scales = [grid.shape[-2] for grid in pca_direction_grids]
     if strides is None:
-        strides = scales
+        strides = [1]
     if isinstance(strides, int):
         strides = [strides]*len(pca_direction_grids)
 
@@ -116,25 +140,37 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
 
         xs = np.mgrid[0:im_size-scale:stride, 0:im_size-scale:stride]  # indexes into pca_direction_grids
         num_grid = xs.shape[1]
+         # stride ratio can be used to account for scenarios where your pca_direction_grid was calculated with strides > 1
+         # if we compute the saliency map with a stride >= to the stride of the pca_direction_grid, it is possible to compute
+         # the saliency map. However, the stride we use to do the saliency map must be an integer multiple of the stride of
+         # the pca direction grid so that we can select from the pca_direction_grid in a strided manner correctly
+        stride_ratio = (num_grid*stride) / pca_direction_grids[s].shape[0]
+        if not np.isclose(stride_ratio, int(stride_ratio)):
+            raise ValueError(f"stride ratio between pca_direction_grids and the image must be an integer, is {stride_ratio}"
+                             f" on {scale=}, {stride=}, {s=}")
+        stride_ratio = int(stride_ratio)
+
         #print(xs, num_grid)
         d_out_d_alpha_grid = np.zeros((num_grid, num_grid))
 
-        strided_indices = xs.transpose(1,2,0).reshape(-1, 2)  # ie should always pass strides=1 pca_directions into this
+        strided_indices = xs.transpose(1,2,0).reshape(-1, 2)
         unstrided_indices = np.mgrid[:num_grid, :num_grid].transpose(1,2,0).reshape(-1, 2)
         for k in tqdm(range(0, num_grid*num_grid, batch_size)):
             actual_batch_size = min(batch_size, num_grid*num_grid-k)
-            batch_locs = strided_indices[k: k+actual_batch_size]
-            batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]  # for indexing into a dense grid (num_grid, num_grid)
+            batch_locs = strided_indices[k: k+actual_batch_size]  # strided so that we index the parts of the image in a strided way
+            batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]  # unstrided so that 
 
-            pca_directions = pca_direction_grids[s][batch_locs[:,0], batch_locs[:,1], component]
+            pca_directions = pca_direction_grids[s][batch_locs[:,0]//stride_ratio, batch_locs[:,1]//stride_ratio, component]
             batch_window_indices = index_windows[:, batch_locs[:,0], batch_locs[:,1], ...]
 
             # do d_output_d_alpha computation
             alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(dataset.cfg.device)
+            # implicit_normalization to put the pca direction in the same space as the image? (probably wrong?)
             direction_tensor = dataset.implicit_normalization(torch.tensor(pca_directions).to(dataset.cfg.device).float())
             img_tensor[np.arange(actual_batch_size)[:,None,None], :, batch_window_indices[0], batch_window_indices[1]] += alpha*direction_tensor
-            output = model(img_tensor)  # sum since gradient will be back-proped as vector of 1`s
-
+            output = model(img_tensor)  
+            
+            # sum since we only need the diagonal elements of the jacobian
             d_out_d_alpha = torch.autograd.grad(output[:,target_class].sum(), alpha)[0].squeeze()
             model.zero_grad()
             d_out_d_alpha_grid[batch_unstrided_locs[:,0], batch_unstrided_locs[:,1]] = d_out_d_alpha.detach().cpu().numpy()
@@ -164,14 +200,17 @@ def pca_direction_grids(model, dataset, target_class, img, scales, pca_direction
     print(scale_wins)
     return saliency_map  # try jacobian with respect to window itself (isnt this just the gradient?)
 
-def visualize_pca_directions(pca_direction_grid_scales, title, scales, lines=True):
-    window_shape = pca_direction_grid_scales[0][0,0].shape
+def visualize_pca_directions(pca_direction_grids, title, lines=True):
+    # note: previous version of pca_direction grids required passing scales as a parameter. It was removed 
+    # since it can be inferred based on pca_direction_grids
+    scales = [grid.shape[-2] for grid in pca_direction_grids]
+    window_shape = pca_direction_grids[0][0,0].shape
     num_components = window_shape[0]
     if len(window_shape) == 4:
         num_channels = window_shape[-1]
     else:
         num_channels = 1
-    num_scales = len(pca_direction_grid_scales)
+    num_scales = len(pca_direction_grids)
     print("Components:", num_components)
     print("Channels:", num_channels)
     print("Scales:", num_scales)
@@ -179,7 +218,7 @@ def visualize_pca_directions(pca_direction_grid_scales, title, scales, lines=Tru
     plt.title(title)
     for component in range(num_components):
         for channel in range(num_channels):
-            for i, res in enumerate(pca_direction_grid_scales):
+            for i, res in enumerate(pca_direction_grids):
                 compressed_results = np.concatenate(np.concatenate(res[:, :, component, :, :, channel], 1), 1)
                 subplot_idx = (component*num_scales*num_channels) + (num_scales*channel) + i+1
                 plt.subplot(num_channels*num_components, num_scales, subplot_idx)

@@ -52,14 +52,24 @@ def find_good_ratio(size): # find ratio as close to a square as possible
     height = size//width
     return min(height, width), max(height, width)  # height, width
 
-def image_grid(img_list):  # plot a grid of images, with img_list being flat
-    height, width = find_good_ratio(len(img_list))
+def image_grid(img_list, titles=None, force_linear=False):  # plot a grid of images, with img_list being flat
+    if force_linear:
+        height = len(img_list)
+        width = 1
+    else:
+        height, width = find_good_ratio(len(img_list))
+    im_size = img_list[0].shape[0]
+    plt.figure(figsize=(4/128*im_size*width, 5/128*im_size*height))
     for i in range(height):
         for j in range(width):
             idx = i*width + j + 1
             plt.subplot(height, width, idx)
-            plt.imshow(img_list[idx])
+            plt.imshow(img_list[idx-1])
+            if titles:
+                plt.title(titles[idx-1])
             remove_borders(plt.gca())
+            plt.xticks([])
+            plt.yticks([])
 
 
 def plt_grid_figure(inpt_grid, col_titles=None, colorbar=True, cmap=None, transpose=False, hspace=-0.4, 

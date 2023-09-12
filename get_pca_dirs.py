@@ -55,13 +55,13 @@ net.to("cuda:0")
 net = hooks.GuidedBackprop(net)
 
 
-default_scales = [3,5,7,9,13,15]
-# pca_dirs = visualizations.find_pca_directions(dsets['train'], 8192, default_scales, 1)
+default_scales = [3,5,7,9,11,15] 
+# pca_dirs = visualizations.find_pca_directions(dsets['train'], default_scales, 2, 2048, split_channels=True)
 
-# with open("big_sample_pca_dirs.pkl", "wb") as p:
+# with open("pca_dirs_split_channels_other.pkl", "wb") as p:
 #     pickle.dump(pca_dirs, p)
 
-with open("big_sample_pca_dirs_reshaped.pkl", "rb") as p:
+with open("full_pca_dirs_split_channels.pkl", "rb") as p:
     pca_dirs = pickle.load(p)
 
 for component in range(4):
@@ -70,5 +70,5 @@ for component in range(4):
         print(sample, target_class, rand_idx)
         pca_saliency = visualizations.pca_direction_grids(net, dsets['valid'], target_class, img, default_scales, pca_dirs,
                                                           strides=2, component=component, batch_size=64)
-        with open(f"./bird_pca_silu/guided_example_{component}_{sample}_{target_class}-{rand_idx}", "wb") as p:
+        with open(f"./bird_pca_split_channels/guided_example_{component}_{sample}_{target_class}-{rand_idx}", "wb") as p:
             pickle.dump(pca_saliency, p)
