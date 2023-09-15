@@ -41,7 +41,7 @@ def combine_saliency_and_img(img, saliency, channel=0, do_abs=True, alpha=0.4, g
     else:
         raise ValueError("Unsupported combining method, must be in ['jet', 'gray', 'bone']")
     blended = cv2.addWeighted(saliency_cmapped, alpha, img, 1-alpha, gamma)
-    return blended
+    return blended, saliency_cmapped
 
 
 def get_sample_for_pca(sample_size, dataset):
@@ -115,6 +115,7 @@ def pca_direction_grid_saliency(model, dataset, target_class, img, pca_direction
     # note: previous version of pca_direction grids required passing scales as a parameter. It was removed 
     # since it can be inferred based on pca_direction_grids.
     # note: this function was renamed to pca_direction_grid_saliency from pca_direction_grids
+    # gaussian was supposed to be you apply a gaussian kernel to d_out_d_alpha to blend things a bit better, never implemented
     model.eval()
     im_size = img.shape[0]
     scales = [grid.shape[-2] for grid in pca_direction_grids]
@@ -147,7 +148,7 @@ def pca_direction_grid_saliency(model, dataset, target_class, img, pca_direction
         stride_ratio = (num_grid*stride) / pca_direction_grids[s].shape[0]
         if not np.isclose(stride_ratio, int(stride_ratio)):
             raise ValueError(f"stride ratio between pca_direction_grids and the image must be an integer, is {stride_ratio}"
-                             f" on {scale=}, {stride=}, {s=}")
+                             f" on {scale=}, {stride=}, {s=}, pca_grid_shape={pca_direction_grids[s].shape[0]}, {num_grid*stride=}")
         stride_ratio = int(stride_ratio)
 
         #print(xs, num_grid)
@@ -157,11 +158,20 @@ def pca_direction_grid_saliency(model, dataset, target_class, img, pca_direction
         unstrided_indices = np.mgrid[:num_grid, :num_grid].transpose(1,2,0).reshape(-1, 2)
         for k in tqdm(range(0, num_grid*num_grid, batch_size)):
             actual_batch_size = min(batch_size, num_grid*num_grid-k)
-            batch_locs = strided_indices[k: k+actual_batch_size]  # strided so that we index the parts of the image in a strided way
-            batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]  # unstrided so that 
+            # strided so that we index the parts of the image in a strided way
+            batch_locs = strided_indices[k: k+actual_batch_size]  
+            # unstrided so that we index into the contiguous/compressed (values we "skip" while striding aren't included in it) d_out_d_alpha_grid
+            batch_unstrided_locs = unstrided_indices[k: k+actual_batch_size]
 
             pca_directions = pca_direction_grids[s][batch_locs[:,0]//stride_ratio, batch_locs[:,1]//stride_ratio, component]
             batch_window_indices = index_windows[:, batch_locs[:,0], batch_locs[:,1], ...]
+            # print(batch_window_indices.shape)
+            # print(batch_locs.shape)
+            # print(batch_unstrided_locs.shape)
+            # print(pca_directions.shape)
+            # print(img_tensor[np.arange(actual_batch_size)[:,None,None], :, batch_window_indices[0], batch_window_indices[1]].shape)
+            # return
+
 
             # do d_output_d_alpha computation
             alpha = torch.zeros((actual_batch_size,1,1,1), requires_grad=True).to(dataset.cfg.device)
@@ -184,7 +194,7 @@ def pca_direction_grid_saliency(model, dataset, target_class, img, pca_direction
     # now, per pixel, interpolate what the d_output_d_alpha value would be if the window
     # were centered at that pixel, then take the max over all possible scales
     #print(d_out_d_alpha_grids[-1])
-    saliency_map = np.zeros_like(img).astype(np.float32)
+    saliency_map = np.zeros((img.shape[0], img.shape[1])).astype(np.float32)
     scale_wins = [0] * len(scales)
     for i in tqdm(range(im_size)):
         for j in range(im_size):
