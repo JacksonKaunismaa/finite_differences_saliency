@@ -7,3 +7,6 @@
 - finite\_differences\_medium\_greyscale.ipynb: Experiments with "medium" version of task + experiments with PCA directions method + comparison with grad and grad\*input methods + experiments on sparseness of map
 	with strides vs. no strides
 - mechanistic\_interpretation.ipynb: An attempt to explain the algorithm the network learns, under the mechanistic interpretability philosophy, done on a tiny version of the model
+
+
+Read the paper [here](https://arxiv.org/abs/2306.00360)
